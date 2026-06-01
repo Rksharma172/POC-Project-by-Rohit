@@ -1,0 +1,113 @@
+app:
+  name: "AskPolicy - Internal Policy Q&A"
+  version: "0.1.0"
+  debug: false
+  environment: "development"
+
+server:
+  host: "0.0.0.0"
+  port: 8000
+  workers: 4
+
+llm:
+  provider: openai          # openai | azure_openai | anthropic | ollama | qwen
+  model: gpt-4o-mini
+  temperature: 0.1
+  max_tokens: 2000
+  request_timeout: 60
+  # azure_openai settings (only used when provider=azure_openai)
+  azure_endpoint: ""
+  azure_api_version: "2024-02-15-preview"
+  azure_deployment: ""
+  # ollama settings
+  ollama_base_url: "http://localhost:11434"
+  # anthropic settings
+  anthropic_model: "claude-3-5-sonnet-20241022"
+
+embeddings:
+  provider: openai          # openai | bge | e5
+  model: text-embedding-3-small
+  dimensions: 1536
+  batch_size: 100
+  # bge/e5 settings (local models)
+  local_model_path: ""
+  device: "cpu"             # cpu | cuda | mps
+
+vectordb:
+  provider: chromadb        # chromadb | faiss | pinecone | weaviate
+  collection_name: "policy_documents"
+  persist_directory: "./data/chroma"
+  # pinecone settings
+  pinecone_index: ""
+  pinecone_environment: ""
+  # weaviate settings
+  weaviate_url: "http://localhost:8080"
+
+database:
+  provider: sqlite          # sqlite | postgresql
+  sqlite_path: "./data/askpolicy.db"
+  # postgresql settings
+  postgres_url: ""
+
+cache:
+  enabled: true
+  provider: redis
+  host: "localhost"
+  port: 6379
+  db: 0
+  ttl_seconds: 3600         # 1 hour default
+  response_cache_ttl: 86400 # 24 hours
+  embedding_cache_ttl: 604800 # 7 days
+
+ingestion:
+  upload_dir: "./data/uploads"
+  max_file_size_mb: 50
+  supported_extensions: ["pdf", "docx", "txt", "html"]
+  async_processing: true
+
+chunking:
+  chunk_size: 512
+  chunk_overlap: 50
+  min_chunk_size: 100
+  preserve_headings: true
+
+duplicate_detection:
+  enabled: true
+  file_hash: true
+  content_hash: true
+  semantic_similarity: true
+  semantic_threshold: 0.95   # cosine similarity threshold
+
+search:
+  top_k: 5
+  hybrid_search: true
+  semantic_weight: 0.7
+  bm25_weight: 0.3
+  reranking_enabled: false
+  reranker_model: "BAAI/bge-reranker-base"
+
+guardrails:
+  enabled: true
+  min_confidence: 0.5
+  require_citations: true
+  max_answer_length: 2000
+
+logging:
+  level: "INFO"
+  format: "json"
+  file: "./logs/askpolicy.log"
+  rotation: "daily"
+  retention_days: 30
+
+monitoring:
+  prometheus_enabled: true
+  metrics_port: 9090
+  cost_tracking: true
+  cost_per_1k_tokens_input: 0.00015
+  cost_per_1k_tokens_output: 0.0006
+
+retry:
+  max_attempts: 3
+  initial_delay: 1.0
+  backoff_multiplier: 2.0
+  max_delay: 30.0
