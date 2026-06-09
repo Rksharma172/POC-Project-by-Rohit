@@ -1,0 +1,14 @@
+pymupdf
+python-docx
+pandas
+openpyxl
+xlrd
+beautifulsoup4
+pdf2image
+pytesseract
+pillow
+openai
+sentence-transformers
+chromadb
+pyyaml
+python-dotenv
