@@ -1,0 +1,41 @@
+# PDF parsing
+pymupdf
+
+# DOCX parsing
+python-docx
+
+# Excel / CSV
+pandas
+openpyxl
+xlrd
+
+# HTML parsing
+beautifulsoup4
+
+# OCR fallback
+pdf2image
+pytesseract
+pillow
+
+# Embeddings
+sentence-transformers
+
+# Vector DB
+chromadb
+
+# API
+fastapi
+uvicorn
+python-multipart
+aiofiles
+
+# Cache
+redis
+celery[redis]
+
+# Config
+pyyaml
+
+# Utilities
+python-dotenv
+requests

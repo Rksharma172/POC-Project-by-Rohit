@@ -4,7 +4,21 @@ vectordb:
 
 embeddings:
   provider: "bge"
+  model: "BAAI/bge-small-en-v1.5"
+  batch_size: 32
 
 chunking:
-  chunk_size: 500
+  strategy: "semantic"
+  chunk_size: 512
   chunk_overlap: 50
+  min_chunk_size: 100
+
+cache:
+  host: "redis"          
+  port: 6379
+  ttl_seconds: 3600
+  embedding_ttl: 86400
+
+celery:
+  broker: "redis://redis:6379/0"
+  backend: "redis://redis:6379/1"

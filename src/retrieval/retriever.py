@@ -1,40 +1,56 @@
 import chromadb
 from sentence_transformers import SentenceTransformer
+from src.config_loader import load_config
 
-# ── Connect to ChromaDB ──────────────────────────────────────
-# Same path where ingestion stored the data
-client = chromadb.PersistentClient(path="./chroma_db")
-collection = client.get_or_create_collection("policy_documents")
+config = load_config()
 
-# ── Load BGE model ───────────────────────────────────────────
-# Same model used during ingestion
-model = SentenceTransformer("BAAI/bge-small-en-v1.5")
+# Connect to ChromaDB
+client = chromadb.PersistentClient(
+    path=config["vectordb"]["persist_directory"]
+)
+
+# Load BGE model once
+model = SentenceTransformer(
+    config["embeddings"]["model"]
+)
+
+
+def get_collection():
+    """Always get fresh collection"""
+    return client.get_or_create_collection(
+        name=config["vectordb"]["collection_name"]
+    )
 
 
 def retrieve(question, top_k=5):
-    """
-    Takes a question and returns top_k most relevant chunks
-    from ChromaDB
-    """
-
-    # Step 1: Convert question to numbers (embedding)
     print(f"  Embedding question...")
     question_embedding = model.encode(question).tolist()
 
-    # Step 2: Search ChromaDB for similar chunks
-    print(f"  Searching ChromaDB...")
+    # Always get fresh collection
+    collection = get_collection()
+    total = collection.count()
+    print(f"  Searching ChromaDB ({total} chunks)...")
+
+    if total == 0:
+        print(" ChromaDB is empty!")
+        return []
+
+    # Search
     results = collection.query(
         query_embeddings=[question_embedding],
-        n_results=top_k
+        n_results=min(top_k, total)  # don't ask for more than exists
     )
 
-    # Step 3: Format results
     chunks = []
     for i, doc in enumerate(results["documents"][0]):
         chunks.append({
-            "text": doc,
-            "source": results["metadatas"][0][i]["source"],
-            "distance": results["distances"][0][i]  # similarity score
+            "text"    : doc,
+            "source"  : results["metadatas"][0][i]["source"],
+            "distance": results["distances"][0][i]
         })
+
+    print(f" Found {len(chunks)} chunks")
+    for c in chunks:
+        print(f"     → {c['source']} (score: {c['distance']:.4f})")
 
     return chunks

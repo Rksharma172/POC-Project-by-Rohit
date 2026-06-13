@@ -1,49 +1,34 @@
-# ── Build stage ────────────────────────────────────────────────────────────────
-FROM python:3.12-slim AS builder
+# Use Python 3.11
+FROM python:3.11-slim
 
-WORKDIR /build
-
-# Install build dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    libmagic1 \
-    && rm -rf /var/lib/apt/lists/*
-
-COPY requirements.txt .
-RUN pip install --upgrade pip && \
-    pip wheel --no-cache-dir --wheel-dir /wheels -r requirements.txt
-
-
-# ── Runtime stage ──────────────────────────────────────────────────────────────
-FROM python:3.12-slim AS runtime
-
+# Set working directory
 WORKDIR /app
 
-# Install runtime system libraries
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libmagic1 \
-    curl \
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    tesseract-ocr \
+    poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
-# Non-root user
-RUN groupadd -r askpolicy && useradd -r -g askpolicy askpolicy
+# Use stable pip settings for Docker build network retries
+ENV PIP_DEFAULT_TIMEOUT=120 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# Install wheels from builder
-COPY --from=builder /wheels /wheels
-RUN pip install --no-cache-dir --no-index --find-links=/wheels /wheels/*.whl
+# Copy requirements first (for caching)
+COPY requirements.txt .
 
-# Copy application
+# Install Python dependencies with retry logic
+RUN python -m pip install --upgrade pip setuptools wheel \
+    && pip install --no-cache-dir --retries 10 --timeout 120 -r requirements.txt
+
+# Copy all project files
 COPY . .
 
-# Create required directories
-RUN mkdir -p data/uploads data/chroma logs && \
-    chown -R askpolicy:askpolicy /app
+# Create necessary folders
+RUN mkdir -p documents chroma_db logs templates
 
-USER askpolicy
-
+# Expose port
 EXPOSE 8000
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
-
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+# Run FastAPI
+CMD ["python", "-m", "uvicorn", "src.api:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]

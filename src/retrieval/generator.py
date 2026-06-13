@@ -1,22 +1,29 @@
 import requests
+import os
+
+OLLAMA_HOST = os.getenv(
+    "OLLAMA_URL",
+    "http://host.docker.internal:11434"
+)
+OLLAMA_URL = f"{OLLAMA_HOST}/api/generate"
 
 
 def generate_answer(question, chunks):
-    # Build context from chunks
-    context = ""
+    context_parts = []
     for i, chunk in enumerate(chunks):
-        context += f"\n--- Source {i+1}: {chunk['source']} ---\n"
-        context += chunk["text"] + "\n"
+        context_parts.append(
+            f"\n--- Source {i+1}: {chunk.get('source', 'unknown')} ---\n"
+            f"{chunk.get('text', '')}"
+        )
+    context = "\n".join(context_parts)
 
-    # Build prompt
-    prompt = f"""You are a helpful HR assistant that answers questions 
-based only on the company policy documents provided below.
+    prompt = f"""You are a helpful HR assistant.
 
-Rules:
-- Answer only from the context provided
-- If answer is not in context say "I don't know based on provided documents"
-- Keep answer clear and concise
-- Always mention which document the answer comes from
+You MUST follow these rules:
+- Use ONLY the given context
+- If answer is missing say: "I don't know based on provided documents"
+- Be concise and clear
+- Always mention source name
 
 CONTEXT:
 {context}
@@ -24,27 +31,30 @@ CONTEXT:
 QUESTION:
 {question}
 
-ANSWER:"""
+ANSWER:
+"""
 
-    print(f"  Sending to Qwen 2.5:7b...")
     try:
+        print(f"  Sending to Ollama: {OLLAMA_URL}")
         response = requests.post(
-            "http://localhost:11434/api/generate",
+            OLLAMA_URL,
             json={
-                "model": "qwen2.5:7b",
+                "model" : "qwen2.5:7b",
                 "prompt": prompt,
-                "stream": False
+                "stream": False,
+                "options": {
+                    "temperature": 0.2,
+                    "top_p"      : 0.9
+                }
             },
             timeout=120
         )
-
-        if response.status_code == 200:
-            return response.json()["response"]
-        else:
-            return f"Error from Ollama: {response.status_code}"
+        response.raise_for_status()
+        return response.json().get("response", "No response")
 
     except requests.exceptions.ConnectionError:
-        return "Error: Ollama is not running. Please run 'ollama serve' first."
-
+        return "Error: Cannot connect to Ollama. Make sure ollama is running."
+    except requests.exceptions.Timeout:
+        return "Error: Request timed out."
     except Exception as e:
-        return f"Error: {e}"
+        return f"Unexpected error: {str(e)}"
