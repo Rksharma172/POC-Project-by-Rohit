@@ -5,6 +5,7 @@ OLLAMA_HOST = os.getenv(
     "OLLAMA_URL",
     "http://host.docker.internal:11434"
 )
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
 OLLAMA_URL = f"{OLLAMA_HOST}/api/generate"
 OLLAMA_MODEL = "qwen2.5:7b"
 
@@ -40,7 +41,7 @@ ANSWER:
         response = requests.post(
             OLLAMA_URL,
             json={
-                "model" : "qwen2.5:7b",
+                "model" : OLLAMA_MODEL,
                 "prompt": prompt,
                 "stream": False,
                 "options": {
@@ -57,5 +58,17 @@ ANSWER:
         return "Error: Cannot connect to Ollama. Make sure ollama is running."
     except requests.exceptions.Timeout:
         return "Error: Request timed out."
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code == 404:
+            try:
+                err = e.response.json().get("error", "")
+                if "not found" in err.lower():
+                    return (
+                        f"Error: Ollama model '{OLLAMA_MODEL}' is not installed. "
+                        f"Run: ollama pull {OLLAMA_MODEL}"
+                    )
+            except ValueError:
+                pass
+        return f"Unexpected error: {str(e)}"
     except Exception as e:
         return f"Unexpected error: {str(e)}"

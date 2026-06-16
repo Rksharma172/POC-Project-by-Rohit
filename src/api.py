@@ -5,6 +5,7 @@ sys.path.insert(0, os.path.abspath(
 ))
 
 import shutil
+
 import requests
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -158,9 +159,24 @@ def get_single_followup(question: str, answer: str) -> str:
     Generate 1 relevant follow-up suggestion
     Starts with "Would you like to know more about..."
     """
+<<<<<<< HEAD
     prompt = f"""Based on this Q&A about company policy,
 generate exactly ONE follow-up question starting with
 "Would you like to know more about"
+=======
+    import requests
+    import os
+
+    ollama_host = os.getenv(
+        "OLLAMA_URL",
+        "http://host.docker.internal:11434"
+    )
+    ollama_model = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
+
+    try:
+        prompt = f"""Based on this Q&A about company policies,
+suggest exactly 3 short follow-up questions an employee might ask.
+>>>>>>> a190bc1159827cff98ebb88516f77223772f2a4e
 
 Question: {question}
 Answer: {answer[:200]}
@@ -171,7 +187,19 @@ Rules:
 - Max 15 words total
 - Return ONLY the question nothing else"""
 
+<<<<<<< HEAD
     result = call_ollama(prompt, timeout=30)
+=======
+        response = requests.post(
+            f"{ollama_host}/api/generate",
+            json={
+                "model" : ollama_model,
+                "prompt": prompt,
+                "stream": False
+            },
+            timeout=30
+        )
+>>>>>>> a190bc1159827cff98ebb88516f77223772f2a4e
 
     if result and "would you like" in result.lower():
         # Take only first line
@@ -432,4 +460,21 @@ def cache_stats():
 @app.delete("/cache/clear")
 def clear_all_cache():
     clear_cache()
+<<<<<<< HEAD
     return {"message": " Cache cleared"}
+=======
+    return {"message": "Cache cleared successfully"}
+
+
+@app.get("/health")
+def health_check():
+    """
+    Health check endpoint
+    Used by Docker to verify API is running
+    """
+    return {
+        "status" : "healthy",
+        "api"    : "running",
+        "version": "1.0.0"
+    }
+>>>>>>> a190bc1159827cff98ebb88516f77223772f2a4e
