@@ -4,6 +4,7 @@ const API = "http://localhost:8000";
 window.onload = () => {
     loadDocs();
     loadCacheStats();
+    loadSuggestions();
     setInterval(loadCacheStats, 30000);
 };
 
@@ -56,6 +57,7 @@ async function uploadFile(file) {
             msg.className   = "upload-msg ok";
             msg.textContent = data.message;
             loadDocs();
+            loadSuggestions(); // reload suggestions from new doc
         } else {
             msg.className   = "upload-msg err";
             msg.textContent = data.message;
@@ -70,6 +72,55 @@ async function uploadFile(file) {
 
     document.getElementById("fileInput").value = "";
     setTimeout(() => msg.style.display = "none", 6000);
+}
+
+// ── LOAD SUGGESTIONS (1 per document, always visible) ─────────
+async function loadSuggestions() {
+    const container = document.getElementById("suggestionsBox");
+    if (!container) return;
+
+    container.innerHTML = `
+        <div class="suggestion-loading">
+            ⏳ Loading suggestions...
+        </div>
+    `;
+
+    try {
+        const res  = await fetch(`${API}/suggestions`);
+        const data = await res.json();
+
+        if (data.suggestions && data.suggestions.length > 0) {
+            // Show suggestions as chips
+            // These NEVER disappear — always visible
+            container.innerHTML = data.suggestions.map(s => `
+                <button class="suggestion-chip"
+                        onclick="ask('${s.replace(/'/g, "\\'")}')">
+                    ${s}
+                </button>
+            `).join("");
+        } else {
+            showDefaultSuggestions(container);
+        }
+
+    } catch (err) {
+        showDefaultSuggestions(container);
+    }
+}
+
+function showDefaultSuggestions(container) {
+    const defaults = [
+        "What is the annual leave policy?",
+        "What are the travel expense limits?",
+        "What is the work from home policy?",
+        "What are the office timings?",
+        "How do I apply for sick leave?"
+    ];
+    container.innerHTML = defaults.map(s => `
+        <button class="suggestion-chip"
+                onclick="ask('${s}')">
+            ${s}
+        </button>
+    `).join("");
 }
 
 // ── DOCUMENTS ─────────────────────────────────────────────────
@@ -113,8 +164,8 @@ async function loadDocs() {
 function fileIcon(name) {
     const ext = name.split(".").pop().toLowerCase();
     return {
-        pdf : "📕", docx: "📘", xlsx: "📗",
-        csv : "📊", html: "🌐", txt : "📄", md: "📝"
+        pdf:"📕", docx:"📘", xlsx:"📗",
+        csv:"📊", html:"🌐", txt:"📄", md:"📝"
     }[ext] || "📄";
 }
 
@@ -123,7 +174,8 @@ async function deleteDoc(name) {
     await fetch(`${API}/documents/${name}`,
                 { method: "DELETE" });
     loadDocs();
-    sysMsg(`${name} deleted`);
+    loadSuggestions();
+    sysMsg(`🗑️ ${name} deleted`);
 }
 
 // ── CACHE ─────────────────────────────────────────────────────
@@ -134,7 +186,7 @@ async function loadCacheStats() {
         const ok   = data.status === "connected";
 
         const el = document.getElementById("cacheStatus");
-        el.textContent = ok ? "Connected" : "Offline";
+        el.textContent = ok ? "🟢 Connected" : "🔴 Offline";
         el.className   = "stat-val " + (ok ? "on" : "off");
 
         document.getElementById("cachedCount")
@@ -148,7 +200,7 @@ async function loadCacheStats() {
 async function clearCache() {
     await fetch(`${API}/cache/clear`, { method: "DELETE" });
     loadCacheStats();
-    sysMsg("Cache cleared");
+    sysMsg("⚡ Cache cleared");
 }
 
 // ── CHAT ──────────────────────────────────────────────────────
@@ -158,14 +210,16 @@ async function ask(question) {
     if (!q) return;
     input.value = "";
 
-    // Remove welcome screen
+    // Hide welcome message only (NOT suggestions)
     const w = document.getElementById("welcome");
     if (w) w.remove();
 
+    // Show user message
     addMsg(q, "user");
 
+    // Show loading
     const loadId = addMsg(
-        " Searching documents...", "loading"
+        "⏳ Searching documents...", "loading"
     );
 
     const btn = document.getElementById("sendBtn");
@@ -173,6 +227,7 @@ async function ask(question) {
     btn.textContent = "...";
 
     try {
+        // Get answer
         const res  = await fetch(`${API}/ask`, {
             method : "POST",
             headers: { "Content-Type": "application/json" },
@@ -181,18 +236,38 @@ async function ask(question) {
         const data = await res.json();
 
         removeMsg(loadId);
+
+        // Get 1 relevant follow-up
+        let followup = null;
+        try {
+            const fuRes = await fetch(
+                `${API}/followup` +
+                `?question=${encodeURIComponent(q)}` +
+                `&answer=${encodeURIComponent(
+                    data.answer.substring(0, 200)
+                )}`
+            );
+            const fuData = await fuRes.json();
+            followup     = fuData.followup;
+        } catch (e) {
+            console.log("Followup failed:", e);
+        }
+
+        // Show answer + sources + 1 followup
+        // Suggestions bar stays visible always ✅
         addBotMsg(
             data.answer,
             data.sources,
             data.cached,
-            data.suggestions
+            followup
         );
+
         loadCacheStats();
 
     } catch (err) {
         removeMsg(loadId);
         addMsg(
-            "Cannot connect. Is the API running?",
+            "❌ Cannot connect. Is the API running?",
             "bot"
         );
     }
@@ -202,6 +277,7 @@ async function ask(question) {
     input.focus();
 }
 
+// ── ADD MESSAGE ───────────────────────────────────────────────
 function addMsg(text, type) {
     const box = document.getElementById("chatBox");
     const div = document.createElement("div");
@@ -214,7 +290,8 @@ function addMsg(text, type) {
     return id;
 }
 
-function addBotMsg(answer, sources, cached, suggestions) {
+// ── ADD BOT ANSWER ────────────────────────────────────────────
+function addBotMsg(answer, sources, cached, followup) {
     const box = document.getElementById("chatBox");
     const div = document.createElement("div");
     div.className = "msg bot-msg";
@@ -224,38 +301,31 @@ function addBotMsg(answer, sources, cached, suggestions) {
 
     // Cache badge
     if (cached) {
-        const badge = document.createElement("span");
+        const badge       = document.createElement("span");
         badge.className   = "cache-badge";
         badge.textContent = "⚡ cached";
         div.appendChild(badge);
     }
 
     // Sources
-    if (sources?.length) {
-        const src = document.createElement("div");
+    if (sources && sources.length > 0) {
+        const src       = document.createElement("div");
         src.className   = "sources";
         src.textContent = "📚 Sources: " + sources.join(", ");
         div.appendChild(src);
     }
 
-    // Follow-up suggestions
-    if (suggestions?.length) {
-        const fu = document.createElement("div");
-        fu.className = "followups";
+    // ONE relevant follow-up button
+    if (followup) {
+        const fu     = document.createElement("div");
+        fu.className = "followup-single";
 
-        const lbl = document.createElement("div");
-        lbl.className   = "followup-label";
-        lbl.textContent = "💡 You might also ask:";
-        fu.appendChild(lbl);
+        const btn       = document.createElement("button");
+        btn.className   = "followup-single-btn";
+        btn.textContent = "💡 " + followup;
+        btn.onclick     = () => ask(followup);
 
-        suggestions.forEach(s => {
-            const btn       = document.createElement("button");
-            btn.className   = "followup-btn";
-            btn.textContent = s;
-            btn.onclick     = () => ask(s);
-            fu.appendChild(btn);
-        });
-
+        fu.appendChild(btn);
         div.appendChild(fu);
     }
 
@@ -263,15 +333,17 @@ function addBotMsg(answer, sources, cached, suggestions) {
     box.scrollTop = box.scrollHeight;
 }
 
+// ── REMOVE MESSAGE ────────────────────────────────────────────
 function removeMsg(id) {
     document.getElementById(id)?.remove();
 }
 
+// ── SYSTEM MESSAGE ────────────────────────────────────────────
 function sysMsg(text) {
-    const box = document.getElementById("chatBox");
-    const div = document.createElement("div");
+    const box       = document.getElementById("chatBox");
+    const div       = document.createElement("div");
     div.className   = "system-msg";
     div.textContent = text;
     box.appendChild(div);
-    box.scrollTop = box.scrollHeight;
+    box.scrollTop   = box.scrollHeight;
 }

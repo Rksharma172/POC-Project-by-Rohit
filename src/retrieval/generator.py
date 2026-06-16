@@ -6,6 +6,7 @@ OLLAMA_HOST = os.getenv(
     "http://host.docker.internal:11434"
 )
 OLLAMA_URL = f"{OLLAMA_HOST}/api/generate"
+OLLAMA_MODEL = "qwen2.5:7b"
 
 
 def generate_answer(question, chunks):
