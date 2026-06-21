@@ -9,10 +9,7 @@
 <body>
 <div class="app">
 
-    <!-- ── LEFT SIDEBAR ── -->
     <div class="sidebar">
-
-        <!-- Upload Card -->
         <div class="card">
             <h3>📁 Upload Documents</h3>
             <div class="drop-zone" id="dropZone"
@@ -21,100 +18,59 @@
                  ondragleave="onDragLeave(event)"
                  ondrop="onDrop(event)">
                 <div class="drop-icon">☁️</div>
-                <div class="drop-text">
-                    <b>Click to upload</b> or drag & drop
-                </div>
-                <div class="drop-formats">
-                    PDF · DOCX · XLSX · CSV · HTML · TXT
-                </div>
+                <div class="drop-text"><b>Click to upload</b> or drag & drop</div>
+                <div class="drop-formats">PDF · DOCX · XLSX · CSV · HTML · TXT</div>
             </div>
-
             <input type="file" id="fileInput"
                    accept=".pdf,.docx,.xlsx,.csv,.html,.txt,.md"
                    onchange="onFileSelect(event)">
-
             <div class="progress-wrap" id="progressWrap">
-                <div class="progress-bar">
-                    <div class="progress-fill"></div>
-                </div>
-                <div class="progress-label" id="progressLabel">
-                    Processing...
-                </div>
+                <div class="progress-bar"><div class="progress-fill"></div></div>
+                <div class="progress-label" id="progressLabel">Processing...</div>
             </div>
             <div class="upload-msg" id="uploadMsg"></div>
         </div>
 
-        <!-- Documents Card -->
         <div class="card">
-            <h3>📚 Documents
-                (<span id="docCount">0</span>)
-            </h3>
+            <h3>📚 Documents (<span id="docCount">0</span>)</h3>
             <div class="doc-list" id="docList">
                 <div class="no-docs">No documents yet</div>
             </div>
         </div>
 
-        <!-- Cache Card -->
         <div class="card">
             <h3>⚡ Redis Cache</h3>
-            <div class="stat-row">
-                <span class="stat-label">Status</span>
-                <span class="stat-val" id="cacheStatus">—</span>
-            </div>
-            <div class="stat-row">
-                <span class="stat-label">Cached Answers</span>
-                <span class="stat-val" id="cachedCount">—</span>
-            </div>
-            <div class="stat-row">
-                <span class="stat-label">TTL</span>
-                <span class="stat-val" id="cacheTTL">—</span>
-            </div>
-            <button class="cache-clear-btn" onclick="clearCache()">
-                🗑️ Clear Cache
-            </button>
+            <div class="stat-row"><span class="stat-label">Status</span><span class="stat-val" id="cacheStatus">—</span></div>
+            <div class="stat-row"><span class="stat-label">Cached Answers</span><span class="stat-val" id="cachedCount">—</span></div>
+            <div class="stat-row"><span class="stat-label">TTL</span><span class="stat-val" id="cacheTTL">—</span></div>
+            <button class="cache-clear-btn" onclick="clearCache()">🗑️ Clear Cache</button>
         </div>
-
     </div>
 
-    <!-- ── RIGHT CHAT PANEL ── -->
     <div class="chat-panel">
-
         <div class="chat-header">
             <h1>🏢 AskPolicy</h1>
             <p>Internal Policy Q&A · RAG + Qwen 2.5 · Runs Locally</p>
         </div>
 
-        <!-- ── SUGGESTIONS BAR (always visible) ── -->
-        <div class="suggestions-bar" id="suggestionsBar">
-            <div class="suggestions-bar-title">
-                💡 Quick questions from your documents:
-            </div>
-            <div class="suggestions-bar-chips" id="suggestionsBox">
-                <div class="suggestion-loading">
-                    ⏳ Loading suggestions...
-                </div>
-            </div>
-        </div>
-
-        <!-- ── CHAT MESSAGES ── -->
         <div class="chat-box" id="chatBox">
-            <div class="welcome" id="welcome">
-                <h2>👋 Welcome to AskPolicy</h2>
-                <p>Upload your policy documents on the left,
-                   then click a suggestion above or
-                   type your question below</p>
+            <div class="intro-message">
+                Thank you for connecting with AskPolicy. Our AI Assistant is ready
+                to help answer your questions about company policies based on the
+                documents you upload.
+            </div>
+
+            <div class="suggestions-inline" id="suggestionsBox">
+                <div class="suggestion-loading">⏳ Loading suggestions...</div>
             </div>
         </div>
 
-        <!-- ── INPUT ── -->
         <div class="input-wrap">
             <input type="text" id="qInput"
                    placeholder="Ask about company policies..."
                    onkeypress="if(event.key==='Enter') ask()">
-            <button class="send-btn" id="sendBtn"
-                    onclick="ask()">Send ➤</button>
+            <button class="send-btn" id="sendBtn" onclick="ask()">Send ➤</button>
         </div>
-
     </div>
 </div>
 
