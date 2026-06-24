@@ -1,28 +1,104 @@
-import sys
-import os
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
+import hashlib
 import json
+import os
 import shutil
+import sys
+import threading
+import time
+
 import requests
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from src.retrieval.retriever import retrieve
-from src.retrieval.generator import generate_answer
-from src.cache.redis_cache import (
-    get_cached_answer, set_cached_answer,
-    clear_cache, get_cache_stats,
-    cache_client, REDIS_AVAILABLE
+
+
+# ---------------------------------------------------------
+# Project Path Setup
+# ---------------------------------------------------------
+
+sys.path.insert(
+    0,
+    os.path.abspath(
+        os.path.join(
+            os.path.dirname(__file__),
+            ".."
+        )
+    )
 )
 
-# OLLAMA_HOST   = os.getenv("OLLAMA_URL", "http://host.docker.internal:11434")   # for docker container
-OLLAMA_HOST   = os.getenv("OLLAMA_URL", "http://localhost:11434")   # for localhost
-OLLAMA_MODEL  = "qwen2.5:7b"          # ← 7b model for this GPU laptop
+from src.cache.redis_cache import (
+    REDIS_AVAILABLE,
+    cache_client,
+    clear_cache,
+    get_cache_stats,
+    get_cached_answer,
+    set_cached_answer
+)
+from src.config_loader import load_config
+from src.retrieval.generator import generate_answer
+from src.retrieval.retriever import retrieve
+
+
+# ---------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------
+
+config = load_config()
+
+# Handles both:
+# http://localhost:11434
+# http://localhost:11434/api/generate
+OLLAMA_BASE_URL = os.getenv(
+    "OLLAMA_URL",
+    "http://localhost:11434"
+).rstrip("/")
+
+if OLLAMA_BASE_URL.endswith("/api/generate"):
+    OLLAMA_BASE_URL = OLLAMA_BASE_URL.removesuffix(
+        "/api/generate"
+    )
+
+if OLLAMA_BASE_URL.endswith("/api"):
+    OLLAMA_BASE_URL = OLLAMA_BASE_URL.removesuffix(
+        "/api"
+    )
+
+OLLAMA_GENERATE_URL = (
+    f"{OLLAMA_BASE_URL}/api/generate"
+)
+
+OLLAMA_TAGS_URL = (
+    f"{OLLAMA_BASE_URL}/api/tags"
+)
+
+OLLAMA_MODEL = "qwen2.5:7b"
+
 UPLOAD_FOLDER = "documents"
+
+RETRIEVAL_CONFIG = config.get("retrieval", {})
+
+TOP_K = RETRIEVAL_CONFIG.get("top_k", 5)
+MAX_DISTANCE = RETRIEVAL_CONFIG.get("max_distance", 0.95)
+
+CACHE_TTL = config["cache"].get(
+    "ttl_seconds",
+    3600
+)
+
+SUGGESTIONS_CACHE_KEY = "askpolicy:suggestions"
+
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+# Prevents multiple browser requests from generating
+# suggestions simultaneously.
+SUGGESTIONS_LOCK = threading.Lock()
+
+
+# ---------------------------------------------------------
+# FastAPI Setup
+# ---------------------------------------------------------
 
 app = FastAPI(title="AskPolicy API")
 
@@ -33,53 +109,564 @@ app.add_middleware(
     allow_headers=["*"]
 )
 
-app.mount("/static", StaticFiles(directory="templates"), name="static")
+app.mount(
+    "/static",
+    StaticFiles(directory="templates"),
+    name="static"
+)
 
 
 class QuestionRequest(BaseModel):
     question: str
 
 
-def call_ollama(prompt: str, timeout: int = 60) -> str:
+# ---------------------------------------------------------
+# Ollama Utilities
+# ---------------------------------------------------------
+
+def call_ollama(prompt: str, timeout: int = 45) -> str:
+    """
+    Sends one prompt directly to Ollama.
+    Used for suggestions and follow-up questions.
+    """
+
     try:
+        print(
+            f"  Sending to Ollama: "
+            f"{OLLAMA_GENERATE_URL}"
+        )
+
         response = requests.post(
-            f"{OLLAMA_HOST}/api/generate",
+            OLLAMA_GENERATE_URL,
             json={
                 "model": OLLAMA_MODEL,
                 "prompt": prompt,
                 "stream": False,
-                "options": {"temperature": 0.3, "top_p": 0.9}
+                "options": {
+                    "temperature": 0.1,
+                    "top_p": 0.85
+                }
             },
             timeout=timeout
         )
+
         if response.status_code == 200:
-            return response.json().get("response", "").strip()
+            return response.json().get(
+                "response",
+                ""
+            ).strip()
+
+        print(
+            f"  Ollama returned status code: "
+            f"{response.status_code}"
+        )
+
+        print(
+            f"  Ollama response: "
+            f"{response.text[:300]}"
+        )
+
         return ""
-    except Exception as e:
-        print(f"  Ollama error: {e}")
+
+    except requests.exceptions.Timeout:
+        print("  Ollama request timed out")
+        return ""
+
+    except Exception as error:
+        print(f"  Ollama error: {error}")
         return ""
 
 
-def is_ollama_available():
+def is_ollama_available() -> bool:
+    """
+    Checks whether Ollama server is reachable.
+    """
+
     try:
-        response = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=5)
+        response = requests.get(
+            OLLAMA_TAGS_URL,
+            timeout=5
+        )
+
         return response.status_code == 200
-    except Exception:
+
+    except Exception as error:
+        print(
+            f"  Ollama availability check failed: "
+            f"{error}"
+        )
+
         return False
 
 
-def clear_suggestions_cache():
-    try:
-        if REDIS_AVAILABLE:
-            cache_client.delete("askpolicy:suggestions")
-            print("  Cleared cached suggestions")
-    except Exception as e:
-        print(f"  Could not clear suggestions cache: {e}")
+# ---------------------------------------------------------
+# Redis Cache Utilities
+# ---------------------------------------------------------
 
+def followup_cache_key(question: str) -> str:
+    """
+    Creates one cache key for a question's follow-up.
+    """
+
+    question_hash = hashlib.md5(
+        question.strip()
+        .lower()
+        .encode("utf-8")
+    ).hexdigest()
+
+    return f"askpolicy:followup:{question_hash}"
+
+
+def get_cached_followup(question: str):
+    """
+    Gets saved follow-up question from Redis.
+    """
+
+    if not REDIS_AVAILABLE:
+        return None
+
+    try:
+        value = cache_client.get(
+            followup_cache_key(question)
+        )
+
+        if not value:
+            return None
+
+        if isinstance(value, bytes):
+            value = value.decode("utf-8")
+
+        return value
+
+    except Exception as error:
+        print(
+            f"  Follow-up cache read failed: "
+            f"{error}"
+        )
+
+        return None
+
+
+def set_cached_followup(
+    question: str,
+    followup: str
+):
+    """
+    Saves follow-up question in Redis.
+    """
+
+    if not REDIS_AVAILABLE or not followup:
+        return
+
+    try:
+        cache_client.setex(
+            followup_cache_key(question),
+            CACHE_TTL,
+            followup
+        )
+
+    except Exception as error:
+        print(
+            f"  Follow-up cache save failed: "
+            f"{error}"
+        )
+
+
+def clear_suggestions_cache():
+    """
+    Clears suggestions and all follow-up mappings.
+    """
+
+    if not REDIS_AVAILABLE:
+        return
+
+    try:
+        cache_client.delete(SUGGESTIONS_CACHE_KEY)
+
+        for key in cache_client.scan_iter(
+            match="askpolicy:followup:*"
+        ):
+            cache_client.delete(key)
+
+        print(
+            "  Cleared suggestions and follow-up cache"
+        )
+
+    except Exception as error:
+        print(
+            f"  Could not clear suggestion cache: "
+            f"{error}"
+        )
+
+
+# ---------------------------------------------------------
+# Answer Validation
+# ---------------------------------------------------------
+
+def is_grounded_answer(answer: str) -> bool:
+    """
+    Checks whether answer looks useful and document-grounded.
+    """
+
+    if not answer or not answer.strip():
+        return False
+
+    invalid_answers = [
+        "i don't know based on provided documents",
+        "i do not know based on provided documents",
+        "cannot connect to ollama",
+        "request timed out",
+        "unexpected error",
+        "error:",
+        "no response"
+    ]
+
+    answer_lower = answer.lower()
+
+    return not any(
+        invalid_text in answer_lower
+        for invalid_text in invalid_answers
+    )
+
+
+def get_relevant_chunks(
+    question: str,
+    allowed_sources=None
+) -> list[dict]:
+    """
+    Retrieves relevant chunks from ChromaDB.
+    """
+
+    chunks = retrieve(
+        question,
+        top_k=TOP_K
+    )
+
+    if allowed_sources:
+        chunks = [
+            chunk
+            for chunk in chunks
+            if chunk["source"] in allowed_sources
+        ]
+
+    relevant_chunks = [
+        chunk
+        for chunk in chunks
+        if chunk.get("distance", 999) <= MAX_DISTANCE
+    ]
+
+    return relevant_chunks
+
+
+def text_chunks_to_context(
+    texts: list[str],
+    source: str
+) -> list[dict]:
+    """
+    Converts plain chunk text into generator-compatible chunks.
+    """
+
+    return [
+        {
+            "text": text,
+            "source": source,
+            "distance": 0.0
+        }
+        for text in texts
+        if text and text.strip()
+    ]
+
+
+# ---------------------------------------------------------
+# ChromaDB Utilities
+# ---------------------------------------------------------
+
+def get_document_groups() -> dict:
+    """
+    Returns ChromaDB chunks grouped by source filename.
+    """
+
+    from src.vectordb.chroma_manager import get_collection
+
+    collection = get_collection()
+
+    if collection.count() == 0:
+        return {}
+
+    all_data = collection.get()
+
+    documents = all_data.get("documents", [])
+    metadatas = all_data.get("metadatas", [])
+
+    groups = {}
+
+    for document, metadata in zip(documents, metadatas):
+        source = (
+            metadata.get("source", "unknown")
+            if metadata
+            else "unknown"
+        )
+
+        groups.setdefault(source, []).append(document)
+
+    return groups
+
+
+def get_corpus_signature(groups: dict) -> str:
+    """
+    Creates a signature of current documents and chunk counts.
+    Used to reject old suggestion cache after upload/delete.
+    """
+
+    summary = sorted(
+        [
+            {
+                "source": source,
+                "chunk_count": len(chunks)
+            }
+            for source, chunks in groups.items()
+        ],
+        key=lambda item: item["source"]
+    )
+
+    raw = json.dumps(
+        summary,
+        sort_keys=True
+    )
+
+    return hashlib.md5(
+        raw.encode("utf-8")
+    ).hexdigest()
+
+
+# ---------------------------------------------------------
+# Follow-up Generation
+# ---------------------------------------------------------
+
+def generate_validated_followup(
+    question: str,
+    answer: str,
+    chunks: list[dict]
+):
+    """
+    Generates one document-grounded follow-up question.
+    """
+
+    cached_followup = get_cached_followup(question)
+
+    if cached_followup:
+        return cached_followup
+
+    if not chunks:
+        return None
+
+    context = "\n\n".join(
+        chunk["text"]
+        for chunk in chunks[:3]
+    )[:1800]
+
+    if not context.strip():
+        return None
+
+    prompt = f"""Create exactly ONE factual follow-up question.
+
+ORIGINAL QUESTION:
+{question}
+
+ORIGINAL ANSWER:
+{answer}
+
+DOCUMENT CONTENT:
+{context}
+
+RULES:
+1. The follow-up must be answerable only from DOCUMENT CONTENT.
+2. It must be related to the original answer.
+3. Do not repeat the original question.
+4. Do not ask opinion, vague, or inference questions.
+5. Start exactly with:
+Would you like to know more about
+6. Maximum 15 words.
+7. Return only one question.
+"""
+
+    followup = call_ollama(
+        prompt,
+        timeout=30
+    )
+
+    if not followup:
+        return None
+
+    followup = followup.split("\n")[0].strip()
+
+    if not followup.lower().startswith(
+        "would you like to know more about"
+    ):
+        return None
+
+    # UI shows the friendly follow-up question.
+    # Qwen receives a document-style question internally.
+    document_question = followup.replace(
+        "Would you like to know more about",
+        "Explain"
+    ).rstrip("?") + " based only on the provided document."
+
+    followup_answer = generate_answer(
+        document_question,
+        chunks
+    )
+
+    if not is_grounded_answer(followup_answer):
+        return None
+
+    sources = sorted(
+        list(
+            set(
+                chunk["source"]
+                for chunk in chunks
+            )
+        )
+    )
+
+    # Cache using original wording because frontend sends this.
+    set_cached_answer(
+        followup,
+        followup_answer,
+        sources
+    )
+
+    set_cached_followup(
+        question,
+        followup
+    )
+
+    return followup
+
+
+# ---------------------------------------------------------
+# Suggestion Helpers
+# ---------------------------------------------------------
+
+def clean_generated_question(text: str) -> str:
+    """
+    Cleans Qwen output into a single question.
+    """
+
+    if not text:
+        return ""
+
+    return (
+        text
+        .split("\n")[0]
+        .strip()
+        .lstrip("0123456789.-) \"'")
+        .rstrip("\"'")
+    )
+
+
+def create_one_valid_suggestion(
+    source: str,
+    selected_texts: list[str],
+    existing_suggestions: list[str]
+):
+    """
+    Creates one question from selected chunks and validates it.
+    Returns question string or None.
+    """
+
+    context_chunks = text_chunks_to_context(
+        selected_texts,
+        source
+    )
+
+    context = "\n\n".join(
+        chunk["text"]
+        for chunk in context_chunks
+    )[:1800]
+
+    if len(context.strip()) < 50:
+        print("     SKIPPED: context too short")
+        return None
+
+    prompt = f"""Create exactly ONE factual question from the document content.
+
+DOCUMENT CONTENT:
+{context}
+
+STRICT RULES:
+1. The answer must be explicitly present in DOCUMENT CONTENT.
+2. Ask about a concrete fact, instruction, step, requirement, feature, tool, date, number, or definition.
+3. Do not ask vague questions.
+4. Do not use phrases such as "this content" or "in practice".
+5. Maximum 14 words.
+6. Return only one question ending with ?.
+"""
+
+    generated = call_ollama(
+        prompt,
+        timeout=30
+    )
+
+    question = clean_generated_question(generated)
+
+    if not question:
+        print(
+            "     REJECTED: Ollama returned nothing"
+        )
+        return None
+
+    print(f"     Generated: {question}")
+
+    if len(question) < 6:
+        print(
+            "     REJECTED: question is too short"
+        )
+        return None
+
+    if not question.endswith("?"):
+        print(
+            "     REJECTED: invalid question format"
+        )
+        return None
+
+    if question in existing_suggestions:
+        print(
+            "     REJECTED: duplicate question"
+        )
+        return None
+
+    answer = generate_answer(
+        question,
+        context_chunks
+    )
+
+    if not is_grounded_answer(answer):
+        print(
+            "     REJECTED: answer was not grounded"
+        )
+        return None
+
+    set_cached_answer(
+        question,
+        answer,
+        [source]
+    )
+
+    print(f"     VALID: [{source}] {question}")
+
+    return question
+
+
+# ---------------------------------------------------------
+# Basic Routes
+# ---------------------------------------------------------
 
 @app.get("/")
 def home():
-    return {"status": "AskPolicy API running"}
+    return {
+        "status": "AskPolicy API running"
+    }
 
 
 @app.get("/chat")
@@ -89,61 +676,131 @@ def chat_ui():
 
 @app.get("/health")
 def health_check():
-    return {"status": "healthy", "api": "running", "model": OLLAMA_MODEL}
+    return {
+        "status": "healthy",
+        "embedding_model": config["embeddings"]["model"],
+        "generator_model": OLLAMA_MODEL,
+        "ollama_url": OLLAMA_GENERATE_URL,
+        "max_distance": MAX_DISTANCE
+    }
 
+
+# ---------------------------------------------------------
+# Ask Question Route
+# ---------------------------------------------------------
 
 @app.post("/ask")
 def ask_question(request: QuestionRequest):
-    print(f"\nQuestion: {request.question}")
+    question = request.question.strip()
 
-    cached = get_cached_answer(request.question)
+    print(f"\nQuestion: {question}")
+
+    if not question:
+        return {
+            "answer": "Please enter a question.",
+            "sources": [],
+            "cached": False,
+            "followup": None
+        }
+
+    cached = get_cached_answer(question)
+
     if cached:
         print("  Returning cached answer")
-        followup = get_single_followup(request.question, cached["answer"])
+
+        answer = cached["answer"]
+        sources = cached["sources"]
+
+        followup = get_cached_followup(question)
+
+        if not followup:
+            chunks = get_relevant_chunks(
+                question,
+                allowed_sources=sources
+            )
+
+            if chunks:
+                followup = generate_validated_followup(
+                    question,
+                    answer,
+                    chunks
+                )
+
         return {
-            "answer": cached["answer"],
-            "sources": cached["sources"],
+            "answer": answer,
+            "sources": sources,
             "cached": True,
             "followup": followup
         }
 
     print("  Searching ChromaDB...")
-    chunks = retrieve(request.question, top_k=5)
 
-    if not chunks:
-        return {
-            "answer": "I could not find relevant information in the uploaded documents.",
-            "sources": [],
-            "cached": False,
-            "followup": None
-        }
+    chunks = retrieve(
+        question,
+        top_k=TOP_K
+    )
 
-    RELEVANCE_THRESHOLD = 1.0
-    relevant_chunks = [c for c in chunks if c.get("distance", 0) < RELEVANCE_THRESHOLD]
+    relevant_chunks = [
+        chunk
+        for chunk in chunks
+        if chunk.get("distance", 999) <= MAX_DISTANCE
+    ]
 
-    print(f"  {len(chunks)} chunks retrieved, {len(relevant_chunks)} passed relevance filter")
-    for c in chunks:
-        print(f"     distance={c.get('distance', 'N/A'):.4f} source={c['source']}")
+    print(
+        f"  {len(chunks)} chunks retrieved, "
+        f"{len(relevant_chunks)} passed relevance filter"
+    )
+
+    for chunk in chunks:
+        print(
+            f"     distance="
+            f"{chunk.get('distance', 999):.4f} "
+            f"source={chunk['source']}"
+        )
 
     if not relevant_chunks:
         return {
-            "answer": "I don't know based on provided documents",
+            "answer": (
+                "I don't know based on provided documents"
+            ),
             "sources": [],
             "cached": False,
             "followup": None
         }
 
-    print("  Generating answer with Qwen 2.5:7b...")
-    answer  = generate_answer(request.question, relevant_chunks)
-    sources = list(set(c["source"] for c in relevant_chunks))
+    answer = generate_answer(
+        question,
+        relevant_chunks
+    )
 
-    if "i don't know" in answer.lower() or "i do not know" in answer.lower():
-        sources = []
+    if not is_grounded_answer(answer):
+        return {
+            "answer": answer,
+            "sources": [],
+            "cached": False,
+            "followup": None
+        }
 
-    followup = get_single_followup(request.question, answer) if sources else None
+    sources = sorted(
+        list(
+            set(
+                chunk["source"]
+                for chunk in relevant_chunks
+            )
+        )
+    )
 
-    if sources:
-        set_cached_answer(request.question, answer, sources)
+    set_cached_answer(
+        question,
+        answer,
+        sources
+    )
+
+    followup = generate_validated_followup(
+        question,
+        answer,
+        relevant_chunks
+    )
 
     return {
         "answer": answer,
@@ -153,297 +810,557 @@ def ask_question(request: QuestionRequest):
     }
 
 
-def get_single_followup(question: str, answer: str) -> str:
-    prompt = f"""Based on this Q&A about company policy,
-generate exactly ONE follow-up question starting with
-"Would you like to know more about"
-
-Question: {question}
-Answer: {answer[:200]}
-
-Rules:
-- Must start with "Would you like to know more about"
-- Max 15 words total
-- Return ONLY the question nothing else"""
-
-    result = call_ollama(prompt, timeout=30)
-
-    if result and "would you like" in result.lower():
-        lines = [l.strip() for l in result.split("\n") if l.strip() and len(l.strip()) > 5]
-        if lines:
-            return lines[0]
-
-    topic = question.lower().replace("what is", "").replace("what are", "")\
-        .replace("how do i", "").replace("how", "").strip()
-    return f"Would you like to know more about {topic}?"
-
-
-def get_document_groups():
-    from src.vectordb.chroma_manager import get_collection
-    col = get_collection()
-    count = col.count()
-
-    if count == 0:
-        return {}
-
-    all_data = col.get()
-    docs  = all_data.get("documents", [])
-    metas = all_data.get("metadatas", [])
-
-    doc_chunks = {}
-    for doc, meta in zip(docs, metas):
-        source = meta.get("source", "unknown") if meta else "unknown"
-        if source not in doc_chunks:
-            doc_chunks[source] = []
-        doc_chunks[source].append(doc)
-
-    return doc_chunks
-
+# ---------------------------------------------------------
+# Suggestions Route
+# ---------------------------------------------------------
 
 @app.get("/suggestions")
 def get_suggestions():
-    try:
+    """
+    Creates five validated document-based suggestions.
+
+    Initial distribution is fair, for example:
+    Small PDF -> 3
+    Large DOCX -> 2
+
+    If small PDF can create only 2 valid unique questions,
+    missing suggestion is generated from another document
+    that has more available chunks.
+    """
+
+    with SUGGESTIONS_LOCK:
+
+        groups = get_document_groups()
+
+        if not groups:
+            print(
+                "  No document chunks found in ChromaDB"
+            )
+
+            return {
+                "suggestions": [],
+                "source": "no_documents"
+            }
+
+        current_signature = get_corpus_signature(groups)
+
+        # Return cache only if cache matches current documents.
         if REDIS_AVAILABLE:
-            cached = cache_client.get("askpolicy:suggestions")
-            if cached:
-                print("  Returning cached suggestions")
-                return json.loads(cached)
-    except Exception as e:
-        print(f"  Suggestion cache check failed: {e}")
+            try:
+                cached = cache_client.get(
+                    SUGGESTIONS_CACHE_KEY
+                )
 
-    if not is_ollama_available():
-        print("  Ollama not reachable — returning defaults without trying")
-        return {"suggestions": get_default_suggestions(), "source": "ollama_unavailable"}
+                if cached:
+                    if isinstance(cached, bytes):
+                        cached = cached.decode("utf-8")
 
-    doc_chunks = get_document_groups()
+                    cached_data = json.loads(cached)
 
-    if not doc_chunks:
-        print("  No documents in ChromaDB — using defaults")
-        return {"suggestions": get_default_suggestions(), "source": "default"}
+                    cached_suggestions = cached_data.get(
+                        "suggestions",
+                        []
+                    )
 
-    unique_sources = list(doc_chunks.keys())
-    num_docs = len(unique_sources)
-    print(f"\n  Found {num_docs} document(s): {unique_sources}")
+                    cached_signature = cached_data.get(
+                        "corpus_signature"
+                    )
 
-    TOTAL_SUGGESTIONS = 5
+                    if (
+                        cached_suggestions
+                        and cached_signature == current_signature
+                    ):
+                        print(
+                            "  Returning cached validated "
+                            "suggestions"
+                        )
 
-    if num_docs >= TOTAL_SUGGESTIONS:
-        distribution = {src: 1 for src in unique_sources[:TOTAL_SUGGESTIONS]}
-    else:
-        base = TOTAL_SUGGESTIONS // num_docs
-        remainder = TOTAL_SUGGESTIONS % num_docs
+                        return cached_data
+
+                    print(
+                        "  Ignoring stale or empty "
+                        "suggestion cache"
+                    )
+
+                    cache_client.delete(
+                        SUGGESTIONS_CACHE_KEY
+                    )
+
+            except Exception as error:
+                print(
+                    f"  Suggestion cache read failed: "
+                    f"{error}"
+                )
+
+        if not is_ollama_available():
+            return {
+                "suggestions": [],
+                "source": "ollama_unavailable"
+            }
+
+        total_suggestions = 5
+        suggestions = []
+
+        sources = list(groups.keys())
+
+        print(
+            f"\n  Found {len(sources)} document(s): "
+            f"{sources}"
+        )
+
+        # -------------------------------------------------
+        # First round: fair distribution
+        # Example with 2 documents: 3 + 2 = 5
+        # -------------------------------------------------
+
+        base = total_suggestions // len(sources)
+        remainder = total_suggestions % len(sources)
+
         distribution = {}
-        for idx, src in enumerate(unique_sources):
-            distribution[src] = base + (1 if idx < remainder else 0)
 
-    print(f"  Distribution plan: {distribution}")
+        for index, source in enumerate(sources):
+            distribution[source] = base + (
+                1 if index < remainder else 0
+            )
 
-    suggestions = []
+        print(
+            f"  Initial distribution plan: "
+            f"{distribution}"
+        )
 
-    for source, num_questions in distribution.items():
-        chunks = doc_chunks[source]
-        if not chunks:
-            continue
+        for source, needed_count in distribution.items():
+            document_chunks = groups.get(source, [])
 
-        print(f"  Generating {num_questions} question(s) for: {source}")
+            print(
+                f"\n  Creating suggestions for: "
+                f"{source}"
+            )
 
-        sample_chunks = chunks[:min(8, len(chunks))]
-        generated_for_doc = 0
-        attempt = 0
-        max_attempts = num_questions + 2
+            print(
+                f"  Available chunks: "
+                f"{len(document_chunks)}"
+            )
 
-        while generated_for_doc < num_questions and attempt < max_attempts:
-            attempt += 1
-            start_idx = (attempt * 2) % max(len(sample_chunks), 1)
-            content_slice = sample_chunks[start_idx:start_idx + 2] or sample_chunks[:2]
-            sample_text = "\n".join(content_slice)[:500]
-
-            if not sample_text.strip():
+            if not document_chunks:
                 continue
 
-            prompt = f"""Based on this content, generate ONE short question.
+            created_for_source = 0
+            attempt = 0
+            max_attempts = max(
+                needed_count * 8,
+                len(document_chunks)
+            )
 
-CONTENT:
-{sample_text}
+            while (
+                created_for_source < needed_count
+                and attempt < max_attempts
+                and len(suggestions) < total_suggestions
+            ):
+                attempt += 1
 
-Rules:
-- Max 12 words
-- Return ONLY the question
-- No numbering"""
+                # Uses a different chunk each attempt.
+                start_index = (
+                    attempt - 1
+                ) % len(document_chunks)
 
-            result = call_ollama(prompt, timeout=45)
+                selected_texts = [
+                    document_chunks[start_index]
+                ]
 
-            if result:
-                question = result.strip().split("\n")[0].strip()
-                question = question.lstrip("0123456789.-) \"'").rstrip("\"'")
+                print(
+                    f"  Attempt {attempt}: "
+                    f"using chunk {start_index + 1}"
+                )
 
-                if len(question) > 5 and "?" in question and question not in suggestions:
+                question = create_one_valid_suggestion(
+                    source,
+                    selected_texts,
+                    suggestions
+                )
+
+                if question:
                     suggestions.append(question)
-                    generated_for_doc += 1
-                    print(f"     [{source}] {question}")
-            else:
-                print(f"     Ollama call failed for {source}, attempt {attempt}")
+                    created_for_source += 1
 
-    print(f"  Final suggestions count: {len(suggestions)}")
+        # -------------------------------------------------
+        # Second round: fill missing suggestions dynamically
+        # Prefer document with MORE chunks first.
+        # -------------------------------------------------
 
-    if len(suggestions) == 0:
-        result = {"suggestions": get_default_suggestions(), "source": "default"}
-    else:
-        result = {"suggestions": suggestions[:TOTAL_SUGGESTIONS], "source": "documents"}
+        remaining_needed = (
+            total_suggestions - len(suggestions)
+        )
 
-    try:
-        if REDIS_AVAILABLE:
-            cache_client.setex("askpolicy:suggestions", 3600, json.dumps(result))
-            print("  Suggestions cached for future requests")
-    except Exception as e:
-        print(f"  Could not cache suggestions: {e}")
+        if remaining_needed > 0:
+            print(
+                f"\n  Need {remaining_needed} more "
+                f"suggestion(s)."
+            )
 
-    return result
+            print(
+                "  Filling from documents with more "
+                "available content..."
+            )
+
+            fallback_sources = sorted(
+                sources,
+                key=lambda source: len(groups[source]),
+                reverse=True
+            )
+
+            for source in fallback_sources:
+                if len(suggestions) >= total_suggestions:
+                    break
+
+                document_chunks = groups.get(source, [])
+
+                if not document_chunks:
+                    continue
+
+                print(
+                    f"\n  Fallback suggestions from: "
+                    f"{source}"
+                )
+
+                max_fallback_attempts = (
+                    len(document_chunks) * 2
+                )
+
+                for attempt in range(
+                    max_fallback_attempts
+                ):
+                    if len(suggestions) >= total_suggestions:
+                        break
+
+                    start_index = (
+                        attempt % len(document_chunks)
+                    )
+
+                    selected_texts = [
+                        document_chunks[start_index]
+                    ]
+
+                    print(
+                        f"  Fallback attempt "
+                        f"{attempt + 1}: "
+                        f"using chunk {start_index + 1}"
+                    )
+
+                    question = create_one_valid_suggestion(
+                        source,
+                        selected_texts,
+                        suggestions
+                    )
+
+                    if question:
+                        suggestions.append(question)
+
+                        print(
+                            "     FALLBACK VALID: "
+                            f"[{source}] {question}"
+                        )
+
+        # Prevent old suggestion cache if document set changed.
+        latest_groups = get_document_groups()
+        latest_signature = get_corpus_signature(
+            latest_groups
+        )
+
+        if latest_signature != current_signature:
+            print(
+                "  Documents changed during suggestion "
+                "generation."
+            )
+
+            return {
+                "suggestions": [],
+                "source": "documents_changed"
+            }
+
+        result = {
+            "suggestions": suggestions[:total_suggestions],
+            "source": "validated_documents",
+            "corpus_signature": current_signature
+        }
+
+        print(
+            f"\n  Final valid suggestions: "
+            f"{len(result['suggestions'])}"
+        )
+
+        # Never cache empty result.
+        if result["suggestions"] and REDIS_AVAILABLE:
+            try:
+                cache_client.setex(
+                    SUGGESTIONS_CACHE_KEY,
+                    CACHE_TTL,
+                    json.dumps(result)
+                )
+
+                print(
+                    "  Validated suggestions cached"
+                )
+
+            except Exception as error:
+                print(
+                    f"  Suggestion cache save failed: "
+                    f"{error}"
+                )
+
+        else:
+            print(
+                "  Suggestions are empty, so nothing "
+                "was cached"
+            )
+
+        return result
 
 
-def get_default_suggestions():
-    return [
-        "What is the annual leave policy?",
-        "What are the travel expense limits?",
-        "What is the work from home policy?",
-        "What are the office timings?",
-        "How do I apply for sick leave?"
-    ]
-
-
-@app.get("/debug/sources")
-def debug_sources():
-    doc_chunks = get_document_groups()
-    summary = {src: len(chunks) for src, chunks in doc_chunks.items()}
-    return {"total_documents": len(doc_chunks), "chunks_per_document": summary}
-
-
-@app.get("/debug/ollama")
-def debug_ollama():
-    import time
-    available = is_ollama_available()
-    if not available:
-        return {"ollama_reachable": False}
-
-    start = time.time()
-    result = call_ollama("Say hello in one word.", timeout=60)
-    elapsed = time.time() - start
-
-    return {
-        "ollama_reachable": True,
-        "response": result,
-        "elapsed_seconds": round(elapsed, 2)
-    }
-
+# ---------------------------------------------------------
+# Follow-up Route
+# ---------------------------------------------------------
 
 @app.get("/followup")
 def get_followup(question: str, answer: str):
-    followup = get_single_followup(question, answer)
-    return {"followup": followup}
+    """
+    Returns a cached or newly created follow-up.
+    """
 
+    cached_followup = get_cached_followup(question)
+
+    if cached_followup:
+        return {
+            "followup": cached_followup
+        }
+
+    chunks = get_relevant_chunks(question)
+
+    followup = generate_validated_followup(
+        question,
+        answer,
+        chunks
+    )
+
+    return {
+        "followup": followup
+    }
+
+
+# ---------------------------------------------------------
+# Upload Route
+# ---------------------------------------------------------
 
 @app.post("/upload")
-async def upload_document(file: UploadFile = File(...)):
+async def upload_document(
+    file: UploadFile = File(...)
+):
+    """
+    Saves uploaded document and rebuilds ChromaDB.
+    """
+
     try:
-        allowed = [".pdf", ".docx", ".xlsx", ".csv", ".html", ".txt", ".md"]
-        ext = os.path.splitext(file.filename)[1].lower()
+        allowed_extensions = [
+            ".pdf",
+            ".docx",
+            ".xlsx",
+            ".xls",
+            ".csv",
+            ".html",
+            ".htm",
+            ".txt",
+            ".md"
+        ]
 
-        if ext not in allowed:
-            return {"success": False, "message": f"File type {ext} not supported."}
+        extension = os.path.splitext(
+            file.filename
+        )[1].lower()
 
-        file_path = os.path.join(UPLOAD_FOLDER, file.filename)
-        with open(file_path, "wb") as f:
-            shutil.copyfileobj(file.file, f)
+        if extension not in allowed_extensions:
+            return {
+                "success": False,
+                "message": (
+                    f"File type {extension} "
+                    f"is not supported."
+                )
+            }
+
+        file_path = os.path.join(
+            UPLOAD_FOLDER,
+            file.filename
+        )
+
+        with open(file_path, "wb") as output_file:
+            shutil.copyfileobj(
+                file.file,
+                output_file
+            )
+
         print(f"\n  Saved: {file.filename}")
 
-        all_files = os.listdir(UPLOAD_FOLDER)
-        print(f"  All files now: {all_files}")
+        from src.ingestion.chunker import chunk_documents
+        from src.ingestion.parsers.parser_router import (
+            load_documents
+        )
+        from src.vectordb.chroma_manager import (
+            clear_db,
+            store_chunks,
+            verify_db
+        )
 
-        from src.vectordb.chroma_manager import clear_db, store_chunks, verify_db
         clear_db()
 
-        from src.ingestion.parsers.parser_router import load_documents
-        from src.ingestion.chunker import chunk_documents
-
         docs = load_documents(UPLOAD_FOLDER)
-        print(f"  Loaded {len(docs)} documents total")
 
         if not docs:
-            return {"success": False, "message": "No documents could be parsed."}
+            return {
+                "success": False,
+                "message": "No documents could be parsed."
+            }
 
         chunks = chunk_documents(docs)
-        print(f"  Created {len(chunks)} chunks")
+
+        if not chunks:
+            return {
+                "success": False,
+                "message": "No chunks could be created."
+            }
 
         store_chunks(chunks)
         verify_db()
+
         clear_cache()
         clear_suggestions_cache()
 
-        doc_chunks = get_document_groups()
-        print(f"  Chunks per document: { {k: len(v) for k, v in doc_chunks.items()} }")
-
         return {
             "success": True,
-            "message": f"{file.filename} uploaded! {len(chunks)} chunks from {len(docs)} documents.",
+            "message": (
+                f"{file.filename} uploaded successfully. "
+                f"{len(chunks)} chunks created."
+            ),
             "chunks_created": len(chunks),
-            "total_documents": len(docs),
-            "all_files": all_files
+            "total_documents": len(docs)
         }
 
-    except Exception as e:
-        print(f"  Upload error: {e}")
+    except Exception as error:
         import traceback
-        traceback.print_exc()
-        return {"success": False, "message": f"Upload failed: {str(e)}"}
 
+        print(f"  Upload error: {error}")
+        traceback.print_exc()
+
+        return {
+            "success": False,
+            "message": f"Upload failed: {str(error)}"
+        }
+
+
+# ---------------------------------------------------------
+# Document Routes
+# ---------------------------------------------------------
 
 @app.get("/documents")
 def list_documents():
     try:
         files = []
-        for file in os.listdir(UPLOAD_FOLDER):
-            path = os.path.join(UPLOAD_FOLDER, file)
-            if os.path.isfile(path):
-                size = os.path.getsize(path)
-                files.append({"name": file, "size_kb": round(size / 1024, 1)})
-        return {"documents": files}
-    except Exception as e:
-        return {"documents": [], "error": str(e)}
+
+        for filename in os.listdir(UPLOAD_FOLDER):
+            file_path = os.path.join(
+                UPLOAD_FOLDER,
+                filename
+            )
+
+            if os.path.isfile(file_path):
+                size = os.path.getsize(file_path)
+
+                files.append(
+                    {
+                        "name": filename,
+                        "size_kb": round(
+                            size / 1024,
+                            1
+                        )
+                    }
+                )
+
+        return {
+            "documents": files
+        }
+
+    except Exception as error:
+        return {
+            "documents": [],
+            "error": str(error)
+        }
 
 
 @app.delete("/documents/{filename}")
 def delete_document(filename: str):
+    """
+    Deletes one document and rebuilds database
+    from remaining documents.
+    """
+
     try:
-        file_path = os.path.join(UPLOAD_FOLDER, filename)
+        file_path = os.path.join(
+            UPLOAD_FOLDER,
+            filename
+        )
+
         if not os.path.exists(file_path):
-            return {"success": False, "message": f"File {filename} not found"}
+            return {
+                "success": False,
+                "message": (
+                    f"File {filename} not found."
+                )
+            }
 
         os.remove(file_path)
+
         print(f"\n  Deleted: {filename}")
 
-        from src.ingestion.parsers.parser_router import load_documents
         from src.ingestion.chunker import chunk_documents
-        from src.vectordb.chroma_manager import store_chunks, clear_db
+        from src.ingestion.parsers.parser_router import (
+            load_documents
+        )
+        from src.vectordb.chroma_manager import (
+            clear_db,
+            store_chunks
+        )
 
         clear_db()
+
         docs = load_documents(UPLOAD_FOLDER)
 
         if docs:
             chunks = chunk_documents(docs)
             store_chunks(chunks)
-            print(f"  Re-ingested {len(chunks)} chunks")
+
+            print(
+                f"  Re-ingested {len(chunks)} chunks"
+            )
+
         else:
             print("  No documents remaining")
 
         clear_cache()
         clear_suggestions_cache()
 
-        return {"success": True, "message": f"{filename} deleted"}
+        return {
+            "success": True,
+            "message": f"{filename} deleted."
+        }
 
-    except Exception as e:
-        print(f"  Delete error: {e}")
-        return {"success": False, "message": f"Delete failed: {str(e)}"}
+    except Exception as error:
+        print(f"  Delete error: {error}")
 
+        return {
+            "success": False,
+            "message": f"Delete failed: {str(error)}"
+        }
+
+
+# ---------------------------------------------------------
+# Cache Routes
+# ---------------------------------------------------------
 
 @app.get("/cache/stats")
 def cache_stats():
@@ -453,4 +1370,88 @@ def cache_stats():
 @app.delete("/cache/clear")
 def clear_all_cache():
     clear_cache()
-    return {"message": "Cache cleared"}
+    clear_suggestions_cache()
+
+    return {
+        "message": (
+            "Answer, suggestion, and follow-up cache "
+            "cleared."
+        )
+    }
+
+
+# ---------------------------------------------------------
+# Debug Routes
+# ---------------------------------------------------------
+
+@app.get("/debug/sources")
+def debug_sources():
+    groups = get_document_groups()
+
+    return {
+        "total_documents": len(groups),
+        "chunks_per_document": {
+            source: len(chunks)
+            for source, chunks in groups.items()
+        }
+    }
+
+
+@app.get("/debug/suggestions")
+def debug_suggestions():
+    if not REDIS_AVAILABLE:
+        return {
+            "redis_available": False,
+            "cached_suggestions": None
+        }
+
+    try:
+        cached = cache_client.get(
+            SUGGESTIONS_CACHE_KEY
+        )
+
+        if not cached:
+            return {
+                "redis_available": True,
+                "cached_suggestions": None
+            }
+
+        if isinstance(cached, bytes):
+            cached = cached.decode("utf-8")
+
+        return {
+            "redis_available": True,
+            "cached_suggestions": json.loads(cached)
+        }
+
+    except Exception as error:
+        return {
+            "redis_available": True,
+            "error": str(error)
+        }
+
+
+@app.get("/debug/ollama")
+def debug_ollama():
+    available = is_ollama_available()
+
+    if not available:
+        return {
+            "ollama_reachable": False
+        }
+
+    start_time = time.time()
+
+    response = call_ollama(
+        "Say hello in one word.",
+        timeout=30
+    )
+
+    elapsed = time.time() - start_time
+
+    return {
+        "ollama_reachable": True,
+        "model": OLLAMA_MODEL,
+        "response": response,
+        "elapsed_seconds": round(elapsed, 2)
+    }

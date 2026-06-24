@@ -1,23 +1,31 @@
-import chromadb
-from sentence_transformers import SentenceTransformer
 from src.config_loader import load_config
+from src.ingestion.embedder import get_embedding
+from src.vectordb.chroma_manager import get_collection
+
 
 config = load_config()
 
-client = chromadb.PersistentClient(path=config["vectordb"]["persist_directory"])
-model  = SentenceTransformer(config["embeddings"]["model"])
+DEFAULT_TOP_K = config["retrieval"]["top_k"]
 
 
-def get_collection():
-    return client.get_or_create_collection(name=config["vectordb"]["collection_name"])
+def retrieve(question: str, top_k: int = DEFAULT_TOP_K):
+    """
+    Retrieve document chunks closest to the user's question.
 
+    Uses the exact same BGE embedding function as ingestion,
+    semantic chunking, and document storage.
+    """
+    print("  Embedding question...")
 
-def retrieve(question, top_k=5):
-    print(f"  Embedding question...")
-    question_embedding = model.encode(question).tolist()
+    question_embedding = get_embedding(question)
+
+    if not question_embedding:
+        return []
 
     collection = get_collection()
+
     total = collection.count()
+
     print(f"  Searching ChromaDB ({total} chunks)...")
 
     if total == 0:
@@ -30,15 +38,36 @@ def retrieve(question, top_k=5):
     )
 
     chunks = []
-    for i, doc in enumerate(results["documents"][0]):
+
+    documents = results.get("documents", [[]])[0]
+    metadatas = results.get("metadatas", [[]])[0]
+    distances = results.get("distances", [[]])[0]
+
+    for index, document in enumerate(documents):
+        metadata = (
+            metadatas[index]
+            if index < len(metadatas)
+            else {}
+        )
+
+        distance = (
+            distances[index]
+            if index < len(distances)
+            else 999
+        )
+
         chunks.append({
-            "text"    : doc,
-            "source"  : results["metadatas"][0][i]["source"],
-            "distance": results["distances"][0][i]
+            "text": document,
+            "source": metadata.get("source", "unknown"),
+            "distance": float(distance)
         })
 
     print(f"  Found {len(chunks)} chunks")
-    for c in chunks:
-        print(f"     -> {c['source']} (distance: {c['distance']:.4f})")
+
+    for chunk in chunks:
+        print(
+            f"     -> {chunk['source']} "
+            f"(distance: {chunk['distance']:.4f})"
+        )
 
     return chunks

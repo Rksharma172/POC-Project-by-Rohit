@@ -9,13 +9,24 @@ embeddings:
 
 chunking:
   strategy: "semantic"
-  chunk_size: 512
-  chunk_overlap: 50
-  min_chunk_size: 100
+  chunk_size: 900
+  chunk_overlap: 120
+  min_chunk_size: 180
+
+  # Used by embedding-based semantic chunking
+  semantic_breakpoint_percentile: 15
+  semantic_min_similarity: 0.45
+
+retrieval:
+  top_k: 5
+
+  # Chroma cosine distance: lower = more relevant.
+  # Start with 0.95 and tune later from logs.
+  max_distance: 0.95
 
 cache:
-  # host: "redis"  # For running using docker 
-  host: "localhost"          # changed from "redis" to "localhost"
+  # host: "redis"       # Use this inside Docker
+  host: "localhost"     # Use this when running locally
   port: 6379
   ttl_seconds: 3600
   embedding_ttl: 86400
