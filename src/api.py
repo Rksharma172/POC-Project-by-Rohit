@@ -73,7 +73,7 @@ OLLAMA_TAGS_URL = (
     f"{OLLAMA_BASE_URL}/api/tags"
 )
 
-OLLAMA_MODEL = "qwen2.5:7b"
+OLLAMA_MODEL = "qwen2.5:3b"
 
 UPLOAD_FOLDER = "documents"
 

@@ -8,7 +8,6 @@ window.onload = () => {
     loadDocs();
     loadCacheStats();
     loadSuggestions();
-    setInterval(loadCacheStats, 30000);
 };
 
 
@@ -69,11 +68,11 @@ async function uploadFile(file) {
             msg.className = "upload-msg ok";
             msg.textContent = data.message;
 
-            // New document means old suggestions should be replaced.
             suggestionsLoaded = false;
             currentSuggestions = [];
 
             await loadDocs();
+            await loadCacheStats();
             await loadSuggestions(true);
         } else {
             msg.className = "upload-msg err";
@@ -104,12 +103,12 @@ async function loadSuggestions(forceRefresh = false) {
 
     if (!container) return;
 
-    // Prevent duplicate /suggestions requests.
+    // Prevent two /suggestions requests at the same time.
     if (suggestionsRequestRunning) {
         return;
     }
 
-    // Keep existing suggestion buttons visible.
+    // Keep current suggestions visible unless refresh is required.
     if (suggestionsLoaded && !forceRefresh) {
         return;
     }
@@ -122,10 +121,13 @@ async function loadSuggestions(forceRefresh = false) {
         </div>
     `;
 
+    let timeoutId = null;
+
     try {
         const controller = new AbortController();
 
-        const timeoutId = setTimeout(() => {
+        // Stop only if suggestion generation takes longer than 3 minutes.
+        timeoutId = setTimeout(() => {
             controller.abort();
         }, 180000);
 
@@ -133,18 +135,17 @@ async function loadSuggestions(forceRefresh = false) {
             signal: controller.signal
         });
 
-        clearTimeout(timeoutId);
+        if (!res.ok) {
+            throw new Error("Could not load suggestions");
+        }
 
         const data = await res.json();
-
-        console.log("Suggestions response:", data);
 
         currentSuggestions = Array.isArray(data.suggestions)
             ? data.suggestions
             : [];
 
         renderSuggestions(currentSuggestions);
-
         suggestionsLoaded = true;
 
     } catch (err) {
@@ -159,6 +160,10 @@ async function loadSuggestions(forceRefresh = false) {
         suggestionsLoaded = false;
 
     } finally {
+        if (timeoutId) {
+            clearTimeout(timeoutId);
+        }
+
         suggestionsRequestRunning = false;
     }
 }
@@ -185,8 +190,6 @@ function renderSuggestions(suggestions) {
         button.className = "suggestion-chip";
         button.textContent = question;
 
-        // Safe event listener.
-        // No inline onclick string escaping issue.
         button.addEventListener("click", () => {
             ask(question);
         });
@@ -203,8 +206,12 @@ function renderSuggestions(suggestions) {
 async function loadDocs() {
     try {
         const res = await fetch(`${API}/documents`);
-        const data = await res.json();
 
+        if (!res.ok) {
+            throw new Error("Could not load documents");
+        }
+
+        const data = await res.json();
         const docs = data.documents || [];
 
         document.getElementById("docCount").textContent = docs.length;
@@ -274,28 +281,37 @@ function fileIcon(name) {
         pdf: "📕",
         docx: "📘",
         xlsx: "📗",
+        xls: "📗",
         csv: "📊",
         html: "🌐",
+        htm: "🌐",
         txt: "📄",
         md: "📝"
     }[ext] || "📄";
 }
 
 async function deleteDoc(name) {
-    if (!confirm(`Delete ${name}?`)) return;
+    if (!confirm(`Delete ${name}?`)) {
+        return;
+    }
 
     try {
-        await fetch(
+        const res = await fetch(
             `${API}/documents/${encodeURIComponent(name)}`,
             {
                 method: "DELETE"
             }
         );
 
+        if (!res.ok) {
+            throw new Error("Could not delete document");
+        }
+
         suggestionsLoaded = false;
         currentSuggestions = [];
 
         await loadDocs();
+        await loadCacheStats();
         await loadSuggestions(true);
 
         sysMsg(`🗑️ ${name} deleted`);
@@ -314,8 +330,12 @@ async function deleteDoc(name) {
 async function loadCacheStats() {
     try {
         const res = await fetch(`${API}/cache/stats`);
-        const data = await res.json();
 
+        if (!res.ok) {
+            throw new Error("Could not load cache statistics");
+        }
+
+        const data = await res.json();
         const ok = data.status === "connected";
 
         const el = document.getElementById("cacheStatus");
@@ -343,9 +363,13 @@ async function loadCacheStats() {
 
 async function clearCache() {
     try {
-        await fetch(`${API}/cache/clear`, {
+        const res = await fetch(`${API}/cache/clear`, {
             method: "DELETE"
         });
+
+        if (!res.ok) {
+            throw new Error("Could not clear cache");
+        }
 
         suggestionsLoaded = false;
         currentSuggestions = [];
@@ -357,6 +381,7 @@ async function clearCache() {
 
     } catch (err) {
         console.error("Cache clear error:", err);
+        sysMsg("❌ Could not clear cache");
     }
 }
 
@@ -367,10 +392,11 @@ async function clearCache() {
 
 async function ask(question) {
     const input = document.getElementById("qInput");
-
     const q = question || input.value.trim();
 
-    if (!q) return;
+    if (!q) {
+        return;
+    }
 
     input.value = "";
 
@@ -397,24 +423,30 @@ async function ask(question) {
             })
         });
 
+        if (!res.ok) {
+            throw new Error("Could not get answer");
+        }
+
         const data = await res.json();
 
         removeMsg(loadId);
 
-        // Backend already returns followup.
-        // Do NOT call /followup again.
+        // Backend already supplies follow-up if enabled.
+        // Frontend does not call /followup separately.
         const followup = data.followup || null;
 
         addBotMsg(
             data.answer,
-            data.sources,
             data.cached,
             followup
         );
 
+        // Updates cache status only after an actual question.
         loadCacheStats();
 
     } catch (err) {
+        console.error("Ask error:", err);
+
         removeMsg(loadId);
 
         addMsg(
@@ -438,7 +470,6 @@ function addMsg(text, type) {
     const box = document.getElementById("chatBox");
 
     const div = document.createElement("div");
-
     const id = "m" + Date.now() + Math.random();
 
     div.id = id;
@@ -451,11 +482,10 @@ function addMsg(text, type) {
     return id;
 }
 
-function addBotMsg(answer, sources, cached, followup) {
+function addBotMsg(answer, cached, followup) {
     const box = document.getElementById("chatBox");
 
     const div = document.createElement("div");
-
     div.className = "msg bot-msg";
 
     const answerText = document.createElement("span");
@@ -472,22 +502,14 @@ function addBotMsg(answer, sources, cached, followup) {
         div.appendChild(badge);
     }
 
-    if (sources && sources.length > 0) {
-        const src = document.createElement("div");
-
-        src.className = "sources";
-        src.textContent = "📚 Sources: " + sources.join(", ");
-
-        div.appendChild(src);
-    }
+    // No source section is created here.
+    // Source names remain available internally in backend response.
 
     if (followup) {
         const fu = document.createElement("div");
-
         fu.className = "followup-single";
 
         const button = document.createElement("button");
-
         button.className = "followup-single-btn";
         button.textContent = "💡 " + followup;
 
@@ -511,7 +533,6 @@ function sysMsg(text) {
     const box = document.getElementById("chatBox");
 
     const div = document.createElement("div");
-
     div.className = "system-msg";
     div.textContent = text;
 

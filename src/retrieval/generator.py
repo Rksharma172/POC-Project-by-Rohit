@@ -4,8 +4,8 @@ import re
 
 # OLLAMA_HOST  = os.getenv("OLLAMA_URL", "http://host.docker.internal:11434")  # for docker container
 OLLAMA_HOST = os.getenv("OLLAMA_URL", "http://localhost:11434") # using localhost
-OLLAMA_MODEL = "qwen2.5:7b"  
-# OLLAMA_MODEL = "qwen2.5:3b" for smaller model if needed
+#OLLAMA_MODEL = "qwen2.5:7b"  
+OLLAMA_MODEL = "qwen2.5:3b" 
 OLLAMA_URL   = f"{OLLAMA_HOST}/api/generate"
 
 
