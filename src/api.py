@@ -7,7 +7,7 @@ import threading
 import time
 
 import requests
-from fastapi import FastAPI, File, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -28,6 +28,13 @@ sys.path.insert(
     )
 )
 
+from src.auth import (
+    get_demo_users,
+    get_current_owner,
+    hash_token,
+    slugify_owner,
+    verify_login
+)
 from src.cache.redis_cache import (
     REDIS_AVAILABLE,
     cache_client,
@@ -37,6 +44,14 @@ from src.cache.redis_cache import (
     set_cached_answer
 )
 from src.config_loader import load_config
+from src.jobs import (
+    create_job,
+    get_job,
+    latest_job,
+    run_background_job,
+    update_job
+)
+from src.retrieval.evidence import is_evidence_supported
 from src.retrieval.generator import generate_answer
 from src.retrieval.retriever import retrieve
 
@@ -73,7 +88,18 @@ OLLAMA_TAGS_URL = (
     f"{OLLAMA_BASE_URL}/api/tags"
 )
 
-OLLAMA_MODEL = "qwen2.5:3b"
+OLLAMA_MODEL = os.getenv(
+    "OLLAMA_MODEL",
+    config.get("generation", {}).get("answer_model", "qwen2.5:7b")
+)
+
+OLLAMA_SUGGESTION_MODEL = os.getenv(
+    "OLLAMA_SUGGESTION_MODEL",
+    config.get("generation", {}).get(
+        "suggestion_model",
+        "qwen2.5:7b"
+    )
+)
 
 UPLOAD_FOLDER = "documents"
 
@@ -120,11 +146,20 @@ class QuestionRequest(BaseModel):
     question: str
 
 
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
 # ---------------------------------------------------------
 # Ollama Utilities
 # ---------------------------------------------------------
 
-def call_ollama(prompt: str, timeout: int = 45) -> str:
+def call_ollama(
+    prompt: str,
+    timeout: int = 45,
+    model: str = OLLAMA_MODEL
+) -> str:
     """
     Sends one prompt directly to Ollama.
     Used for suggestions and follow-up questions.
@@ -139,7 +174,7 @@ def call_ollama(prompt: str, timeout: int = 45) -> str:
         response = requests.post(
             OLLAMA_GENERATE_URL,
             json={
-                "model": OLLAMA_MODEL,
+                "model": model,
                 "prompt": prompt,
                 "stream": False,
                 "options": {
@@ -199,6 +234,28 @@ def is_ollama_available() -> bool:
         return False
 
 
+def owner_folder(owner: str) -> str:
+    if owner == "default":
+        os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+        return UPLOAD_FOLDER
+
+    path = os.path.join(
+        UPLOAD_FOLDER,
+        slugify_owner(owner)
+    )
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def safe_filename(filename: str) -> str:
+    cleaned = os.path.basename(filename or "").strip()
+
+    if not cleaned:
+        raise ValueError("Filename is required.")
+
+    return cleaned
+
+
 # ---------------------------------------------------------
 # Redis Cache Utilities
 # ---------------------------------------------------------
@@ -215,6 +272,10 @@ def followup_cache_key(question: str) -> str:
     ).hexdigest()
 
     return f"askpolicy:followup:{question_hash}"
+
+
+def scoped_question(owner: str, question: str) -> str:
+    return f"[owner:{owner}] {question}"
 
 
 def get_cached_followup(question: str):
@@ -272,7 +333,7 @@ def set_cached_followup(
         )
 
 
-def clear_suggestions_cache():
+def clear_suggestions_cache(owner: str | None = None):
     """
     Clears suggestions and all follow-up mappings.
     """
@@ -283,9 +344,12 @@ def clear_suggestions_cache():
     try:
         cache_client.delete(SUGGESTIONS_CACHE_KEY)
 
-        for key in cache_client.scan_iter(
-            match="askpolicy:followup:*"
-        ):
+        if owner:
+            cache_client.delete(f"{SUGGESTIONS_CACHE_KEY}:{owner}")
+
+        match = "askpolicy:followup:*"
+
+        for key in cache_client.scan_iter(match=match):
             cache_client.delete(key)
 
         print(
@@ -331,6 +395,7 @@ def is_grounded_answer(answer: str) -> bool:
 
 def get_relevant_chunks(
     question: str,
+    owner: str = "default",
     allowed_sources=None
 ) -> list[dict]:
     """
@@ -339,7 +404,8 @@ def get_relevant_chunks(
 
     chunks = retrieve(
         question,
-        top_k=TOP_K
+        top_k=TOP_K,
+        owner=owner
     )
 
     if allowed_sources:
@@ -381,7 +447,7 @@ def text_chunks_to_context(
 # ChromaDB Utilities
 # ---------------------------------------------------------
 
-def get_document_groups() -> dict:
+def get_document_groups(owner: str = "default") -> dict:
     """
     Returns ChromaDB chunks grouped by source filename.
     """
@@ -393,7 +459,7 @@ def get_document_groups() -> dict:
     if collection.count() == 0:
         return {}
 
-    all_data = collection.get()
+    all_data = collection.get(where={"owner": owner})
 
     documents = all_data.get("documents", [])
     metadatas = all_data.get("metadatas", [])
@@ -446,13 +512,16 @@ def get_corpus_signature(groups: dict) -> str:
 def generate_validated_followup(
     question: str,
     answer: str,
-    chunks: list[dict]
+    chunks: list[dict],
+    owner: str = "default"
 ):
     """
     Generates one document-grounded follow-up question.
     """
 
-    cached_followup = get_cached_followup(question)
+    cached_followup = get_cached_followup(
+        scoped_question(owner, question)
+    )
 
     if cached_followup:
         return cached_followup
@@ -517,7 +586,10 @@ Would you like to know more about
         chunks
     )
 
-    if not is_grounded_answer(followup_answer):
+    if (
+        not is_grounded_answer(followup_answer)
+        or not is_evidence_supported(followup_answer, chunks)
+    ):
         return None
 
     sources = sorted(
@@ -531,13 +603,13 @@ Would you like to know more about
 
     # Cache using original wording because frontend sends this.
     set_cached_answer(
-        followup,
+        scoped_question(owner, followup),
         followup_answer,
         sources
     )
 
     set_cached_followup(
-        question,
+        scoped_question(owner, question),
         followup
     )
 
@@ -566,6 +638,7 @@ def clean_generated_question(text: str) -> str:
 
 
 def create_one_valid_suggestion(
+    owner: str,
     source: str,
     selected_texts: list[str],
     existing_suggestions: list[str]
@@ -605,7 +678,8 @@ STRICT RULES:
 
     generated = call_ollama(
         prompt,
-        timeout=30
+        timeout=30,
+        model=OLLAMA_SUGGESTION_MODEL
     )
 
     question = clean_generated_question(generated)
@@ -647,8 +721,14 @@ STRICT RULES:
         )
         return None
 
+    if not is_evidence_supported(answer, context_chunks):
+        print(
+            "     REJECTED: answer lacked evidence overlap"
+        )
+        return None
+
     set_cached_answer(
-        question,
+        scoped_question(owner, question),
         answer,
         [source]
     )
@@ -680,8 +760,30 @@ def health_check():
         "status": "healthy",
         "embedding_model": config["embeddings"]["model"],
         "generator_model": OLLAMA_MODEL,
+        "suggestion_model": OLLAMA_SUGGESTION_MODEL,
         "ollama_url": OLLAMA_GENERATE_URL,
         "max_distance": MAX_DISTANCE
+    }
+
+
+@app.post("/login")
+def login(request: LoginRequest):
+    owner = verify_login(
+        request.username,
+        request.password
+    )
+
+    if not owner:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid username or password"
+        )
+
+    password = get_demo_users().get(owner, request.password)
+
+    return {
+        "user": owner,
+        "token": hash_token(f"{owner}:{password}")
     }
 
 
@@ -690,7 +792,10 @@ def health_check():
 # ---------------------------------------------------------
 
 @app.post("/ask")
-def ask_question(request: QuestionRequest):
+def ask_question(
+    request: QuestionRequest,
+    owner: str = Depends(get_current_owner)
+):
     question = request.question.strip()
 
     print(f"\nQuestion: {question}")
@@ -703,7 +808,8 @@ def ask_question(request: QuestionRequest):
             "followup": None
         }
 
-    cached = get_cached_answer(question)
+    cache_question = scoped_question(owner, question)
+    cached = get_cached_answer(cache_question)
 
     if cached:
         print("  Returning cached answer")
@@ -711,11 +817,12 @@ def ask_question(request: QuestionRequest):
         answer = cached["answer"]
         sources = cached["sources"]
 
-        followup = get_cached_followup(question)
+        followup = get_cached_followup(cache_question)
 
         if not followup:
             chunks = get_relevant_chunks(
                 question,
+                owner=owner,
                 allowed_sources=sources
             )
 
@@ -723,7 +830,8 @@ def ask_question(request: QuestionRequest):
                 followup = generate_validated_followup(
                     question,
                     answer,
-                    chunks
+                    chunks,
+                    owner=owner
                 )
 
         return {
@@ -737,7 +845,8 @@ def ask_question(request: QuestionRequest):
 
     chunks = retrieve(
         question,
-        top_k=TOP_K
+        top_k=TOP_K,
+        owner=owner
     )
 
     relevant_chunks = [
@@ -773,9 +882,14 @@ def ask_question(request: QuestionRequest):
         relevant_chunks
     )
 
-    if not is_grounded_answer(answer):
+    if (
+        not is_grounded_answer(answer)
+        or not is_evidence_supported(answer, relevant_chunks)
+    ):
         return {
-            "answer": answer,
+            "answer": (
+                "I don't know based on provided documents"
+            ),
             "sources": [],
             "cached": False,
             "followup": None
@@ -791,7 +905,7 @@ def ask_question(request: QuestionRequest):
     )
 
     set_cached_answer(
-        question,
+        cache_question,
         answer,
         sources
     )
@@ -799,7 +913,8 @@ def ask_question(request: QuestionRequest):
     followup = generate_validated_followup(
         question,
         answer,
-        relevant_chunks
+        relevant_chunks,
+        owner=owner
     )
 
     return {
@@ -815,7 +930,9 @@ def ask_question(request: QuestionRequest):
 # ---------------------------------------------------------
 
 @app.get("/suggestions")
-def get_suggestions():
+def get_suggestions(
+    owner: str = Depends(get_current_owner)
+):
     """
     Creates five validated document-based suggestions.
 
@@ -830,7 +947,7 @@ def get_suggestions():
 
     with SUGGESTIONS_LOCK:
 
-        groups = get_document_groups()
+        groups = get_document_groups(owner)
 
         if not groups:
             print(
@@ -848,7 +965,7 @@ def get_suggestions():
         if REDIS_AVAILABLE:
             try:
                 cached = cache_client.get(
-                    SUGGESTIONS_CACHE_KEY
+                    f"{SUGGESTIONS_CACHE_KEY}:{owner}"
                 )
 
                 if cached:
@@ -883,7 +1000,7 @@ def get_suggestions():
                     )
 
                     cache_client.delete(
-                        SUGGESTIONS_CACHE_KEY
+                        f"{SUGGESTIONS_CACHE_KEY}:{owner}"
                     )
 
             except Exception as error:
@@ -973,6 +1090,7 @@ def get_suggestions():
                 )
 
                 question = create_one_valid_suggestion(
+                    owner,
                     source,
                     selected_texts,
                     suggestions
@@ -1047,6 +1165,7 @@ def get_suggestions():
                     )
 
                     question = create_one_valid_suggestion(
+                        owner,
                         source,
                         selected_texts,
                         suggestions
@@ -1061,7 +1180,7 @@ def get_suggestions():
                         )
 
         # Prevent old suggestion cache if document set changed.
-        latest_groups = get_document_groups()
+        latest_groups = get_document_groups(owner)
         latest_signature = get_corpus_signature(
             latest_groups
         )
@@ -1092,7 +1211,7 @@ def get_suggestions():
         if result["suggestions"] and REDIS_AVAILABLE:
             try:
                 cache_client.setex(
-                    SUGGESTIONS_CACHE_KEY,
+                    f"{SUGGESTIONS_CACHE_KEY}:{owner}",
                     CACHE_TTL,
                     json.dumps(result)
                 )
@@ -1121,24 +1240,31 @@ def get_suggestions():
 # ---------------------------------------------------------
 
 @app.get("/followup")
-def get_followup(question: str, answer: str):
+def get_followup(
+    question: str,
+    answer: str,
+    owner: str = Depends(get_current_owner)
+):
     """
     Returns a cached or newly created follow-up.
     """
 
-    cached_followup = get_cached_followup(question)
+    cached_followup = get_cached_followup(
+        scoped_question(owner, question)
+    )
 
     if cached_followup:
         return {
             "followup": cached_followup
         }
 
-    chunks = get_relevant_chunks(question)
+    chunks = get_relevant_chunks(question, owner=owner)
 
     followup = generate_validated_followup(
         question,
         answer,
-        chunks
+        chunks,
+        owner=owner
     )
 
     return {
@@ -1150,9 +1276,110 @@ def get_followup(question: str, answer: str):
 # Upload Route
 # ---------------------------------------------------------
 
+def discover_document_folders() -> list[tuple[str, str]]:
+    folders = []
+
+    if not os.path.isdir(UPLOAD_FOLDER):
+        return folders
+
+    root_has_files = any(
+        os.path.isfile(os.path.join(UPLOAD_FOLDER, name))
+        for name in os.listdir(UPLOAD_FOLDER)
+    )
+
+    if root_has_files:
+        folders.append(("default", UPLOAD_FOLDER))
+
+    for name in os.listdir(UPLOAD_FOLDER):
+        path = os.path.join(UPLOAD_FOLDER, name)
+
+        if os.path.isdir(path):
+            folders.append((slugify_owner(name), path))
+
+    return folders
+
+
+def rebuild_all_documents(job_id: str | None = None):
+    from src.ingestion.chunker import chunk_documents
+    from src.ingestion.parsers.parser_router import load_documents
+    from src.vectordb.chroma_manager import (
+        clear_db,
+        store_chunks,
+        verify_db
+    )
+
+    if job_id:
+        update_job(job_id, status="running", step="Parsing documents")
+
+    all_docs = []
+
+    for folder_owner, folder in discover_document_folders():
+        all_docs.extend(load_documents(folder, owner=folder_owner))
+
+    if job_id:
+        update_job(
+            job_id,
+            step=f"Chunking {len(all_docs)} documents"
+        )
+
+    clear_db()
+
+    if not all_docs:
+        clear_cache()
+        clear_suggestions_cache()
+        return {"docs": 0, "chunks": 0}
+
+    chunks = chunk_documents(all_docs)
+
+    if job_id:
+        update_job(
+            job_id,
+            step=f"Embedding {len(chunks)} chunks"
+        )
+
+    if chunks:
+        store_chunks(chunks)
+        verify_db()
+
+    clear_cache()
+    clear_suggestions_cache()
+
+    return {"docs": len(all_docs), "chunks": len(chunks)}
+
+
+def finish_rebuild_job(job_id: str, success_message: str):
+    try:
+        result = rebuild_all_documents(job_id)
+        update_job(
+            job_id,
+            status="complete",
+            success=True,
+            step="Ready",
+            message=(
+                f"{success_message} "
+                f"{result['chunks']} chunks indexed."
+            ),
+            result=result
+        )
+
+    except Exception as error:
+        import traceback
+
+        print(f"  Background processing error: {error}")
+        traceback.print_exc()
+        update_job(
+            job_id,
+            status="failed",
+            success=False,
+            step="Failed",
+            message=str(error)
+        )
+
+
 @app.post("/upload")
 async def upload_document(
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
+    owner: str = Depends(get_current_owner)
 ):
     """
     Saves uploaded document and rebuilds ChromaDB.
@@ -1184,9 +1411,11 @@ async def upload_document(
                 )
             }
 
+        filename = safe_filename(file.filename)
+
         file_path = os.path.join(
-            UPLOAD_FOLDER,
-            file.filename
+            owner_folder(owner),
+            filename
         )
 
         with open(file_path, "wb") as output_file:
@@ -1195,50 +1424,24 @@ async def upload_document(
                 output_file
             )
 
-        print(f"\n  Saved: {file.filename}")
+        print(f"\n  Saved: {filename} for {owner}")
 
-        from src.ingestion.chunker import chunk_documents
-        from src.ingestion.parsers.parser_router import (
-            load_documents
+        job_id = create_job("upload", owner, filename)
+
+        run_background_job(
+            job_id,
+            lambda running_job_id: finish_rebuild_job(
+                running_job_id,
+                f"{filename} uploaded successfully."
+            )
         )
-        from src.vectordb.chroma_manager import (
-            clear_db,
-            store_chunks,
-            verify_db
-        )
-
-        clear_db()
-
-        docs = load_documents(UPLOAD_FOLDER)
-
-        if not docs:
-            return {
-                "success": False,
-                "message": "No documents could be parsed."
-            }
-
-        chunks = chunk_documents(docs)
-
-        if not chunks:
-            return {
-                "success": False,
-                "message": "No chunks could be created."
-            }
-
-        store_chunks(chunks)
-        verify_db()
-
-        clear_cache()
-        clear_suggestions_cache()
 
         return {
             "success": True,
             "message": (
-                f"{file.filename} uploaded successfully. "
-                f"{len(chunks)} chunks created."
+                f"{filename} uploaded. Processing started."
             ),
-            "chunks_created": len(chunks),
-            "total_documents": len(docs)
+            "job_id": job_id
         }
 
     except Exception as error:
@@ -1258,13 +1461,15 @@ async def upload_document(
 # ---------------------------------------------------------
 
 @app.get("/documents")
-def list_documents():
+def list_documents(owner: str = Depends(get_current_owner)):
     try:
         files = []
 
-        for filename in os.listdir(UPLOAD_FOLDER):
+        folder = owner_folder(owner)
+
+        for filename in os.listdir(folder):
             file_path = os.path.join(
-                UPLOAD_FOLDER,
+                folder,
                 filename
             )
 
@@ -1293,7 +1498,10 @@ def list_documents():
 
 
 @app.delete("/documents/{filename}")
-def delete_document(filename: str):
+def delete_document(
+    filename: str,
+    owner: str = Depends(get_current_owner)
+):
     """
     Deletes one document and rebuilds database
     from remaining documents.
@@ -1301,8 +1509,8 @@ def delete_document(filename: str):
 
     try:
         file_path = os.path.join(
-            UPLOAD_FOLDER,
-            filename
+            owner_folder(owner),
+            safe_filename(filename)
         )
 
         if not os.path.exists(file_path):
@@ -1317,36 +1525,20 @@ def delete_document(filename: str):
 
         print(f"\n  Deleted: {filename}")
 
-        from src.ingestion.chunker import chunk_documents
-        from src.ingestion.parsers.parser_router import (
-            load_documents
-        )
-        from src.vectordb.chroma_manager import (
-            clear_db,
-            store_chunks
-        )
+        job_id = create_job("delete", owner, filename)
 
-        clear_db()
-
-        docs = load_documents(UPLOAD_FOLDER)
-
-        if docs:
-            chunks = chunk_documents(docs)
-            store_chunks(chunks)
-
-            print(
-                f"  Re-ingested {len(chunks)} chunks"
+        run_background_job(
+            job_id,
+            lambda running_job_id: finish_rebuild_job(
+                running_job_id,
+                f"{filename} deleted."
             )
-
-        else:
-            print("  No documents remaining")
-
-        clear_cache()
-        clear_suggestions_cache()
+        )
 
         return {
             "success": True,
-            "message": f"{filename} deleted."
+            "message": f"{filename} deleted. Reindexing started.",
+            "job_id": job_id
         }
 
     except Exception as error:
@@ -1356,6 +1548,28 @@ def delete_document(filename: str):
             "success": False,
             "message": f"Delete failed: {str(error)}"
         }
+
+
+@app.get("/jobs/latest")
+def get_latest_processing_job(
+    owner: str = Depends(get_current_owner)
+):
+    return {
+        "job": latest_job(owner)
+    }
+
+
+@app.get("/jobs/{job_id}")
+def get_processing_job(
+    job_id: str,
+    owner: str = Depends(get_current_owner)
+):
+    job = get_job(job_id, owner=owner)
+
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    return job
 
 
 # ---------------------------------------------------------
@@ -1385,8 +1599,8 @@ def clear_all_cache():
 # ---------------------------------------------------------
 
 @app.get("/debug/sources")
-def debug_sources():
-    groups = get_document_groups()
+def debug_sources(owner: str = Depends(get_current_owner)):
+    groups = get_document_groups(owner)
 
     return {
         "total_documents": len(groups),
@@ -1398,7 +1612,7 @@ def debug_sources():
 
 
 @app.get("/debug/suggestions")
-def debug_suggestions():
+def debug_suggestions(owner: str = Depends(get_current_owner)):
     if not REDIS_AVAILABLE:
         return {
             "redis_available": False,
@@ -1407,7 +1621,7 @@ def debug_suggestions():
 
     try:
         cached = cache_client.get(
-            SUGGESTIONS_CACHE_KEY
+            f"{SUGGESTIONS_CACHE_KEY}:{owner}"
         )
 
         if not cached:

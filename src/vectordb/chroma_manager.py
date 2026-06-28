@@ -105,11 +105,6 @@ def store_chunks(chunks: list[dict]):
         for chunk in chunks
     ]
 
-    sources = [
-        chunk["source"]
-        for chunk in chunks
-    ]
-
     print(f"  Batch embedding {len(texts)} texts...")
 
     embeddings = get_embeddings_batch(texts)
@@ -124,8 +119,12 @@ def store_chunks(chunks: list[dict]):
     ]
 
     metadatas = [
-        {"source": source}
-        for source in sources
+        {
+            "source": chunk.get("source", "unknown"),
+            "owner": chunk.get("owner", "default"),
+            "content_type": chunk.get("content_type", "text")
+        }
+        for chunk in chunks
     ]
 
     batch_size = 100

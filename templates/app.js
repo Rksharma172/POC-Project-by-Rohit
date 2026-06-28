@@ -3,12 +3,100 @@ const API = "http://localhost:8000";
 let suggestionsLoaded = false;
 let suggestionsRequestRunning = false;
 let currentSuggestions = [];
+let currentJobId = null;
+let jobPollTimer = null;
+
+const session = {
+    user: localStorage.getItem("askpolicy_user") || "default",
+    token: localStorage.getItem("askpolicy_token") || ""
+};
 
 window.onload = () => {
+    updateSessionUi();
     loadDocs();
     loadCacheStats();
     loadSuggestions();
+    pollLatestJob();
 };
+
+
+function authHeaders(extra = {}) {
+    return {
+        ...extra,
+        "X-AskPolicy-User": session.user,
+        "X-AskPolicy-Token": session.token
+    };
+}
+
+
+// ---------------------------------------------------------
+// Login
+// ---------------------------------------------------------
+
+async function login() {
+    const userInput = document.getElementById("loginUser");
+    const passInput = document.getElementById("loginPass");
+    const msg = document.getElementById("loginMsg");
+
+    const username = userInput.value.trim();
+    const password = passInput.value;
+
+    if (!username || !password) {
+        msg.textContent = "Enter username and password.";
+        return;
+    }
+
+    try {
+        const res = await fetch(`${API}/login`, {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({username, password})
+        });
+
+        if (!res.ok) {
+            throw new Error("Invalid login");
+        }
+
+        const data = await res.json();
+        session.user = data.user;
+        session.token = data.token;
+        localStorage.setItem("askpolicy_user", session.user);
+        localStorage.setItem("askpolicy_token", session.token);
+
+        passInput.value = "";
+        msg.textContent = "";
+        suggestionsLoaded = false;
+        currentSuggestions = [];
+
+        updateSessionUi();
+        await loadDocs();
+        await loadCacheStats();
+        await loadSuggestions(true);
+        sysMsg(`Signed in as ${session.user}`);
+
+    } catch (err) {
+        msg.textContent = "Login failed.";
+    }
+}
+
+function logout() {
+    session.user = "default";
+    session.token = "";
+    localStorage.removeItem("askpolicy_user");
+    localStorage.removeItem("askpolicy_token");
+    suggestionsLoaded = false;
+    currentSuggestions = [];
+    updateSessionUi();
+    loadDocs();
+    loadSuggestions(true);
+    sysMsg("Signed out.");
+}
+
+function updateSessionUi() {
+    document.getElementById("activeUser").textContent = session.user;
+    document.getElementById("loginUser").value =
+        session.user === "default" ? "" : session.user;
+}
 
 
 // ---------------------------------------------------------
@@ -42,13 +130,7 @@ function onFileSelect(e) {
 async function uploadFile(file) {
     if (!file) return;
 
-    const prog = document.getElementById("progressWrap");
-    const msg = document.getElementById("uploadMsg");
-    const lbl = document.getElementById("progressLabel");
-
-    prog.style.display = "block";
-    msg.style.display = "none";
-    lbl.textContent = `Uploading ${file.name}...`;
+    setProcessingState(`Uploading ${file.name}...`);
 
     try {
         const fd = new FormData();
@@ -56,41 +138,123 @@ async function uploadFile(file) {
 
         const res = await fetch(`${API}/upload`, {
             method: "POST",
+            headers: authHeaders(),
             body: fd
         });
 
         const data = await res.json();
 
-        prog.style.display = "none";
-        msg.style.display = "block";
-
         if (data.success) {
-            msg.className = "upload-msg ok";
-            msg.textContent = data.message;
-
             suggestionsLoaded = false;
             currentSuggestions = [];
-
+            currentJobId = data.job_id;
+            showUploadMessage(data.message, true);
+            pollJob(data.job_id);
             await loadDocs();
-            await loadCacheStats();
-            await loadSuggestions(true);
         } else {
-            msg.className = "upload-msg err";
-            msg.textContent = data.message;
+            finishProcessingState();
+            showUploadMessage(data.message, false);
         }
 
     } catch (err) {
-        prog.style.display = "none";
-        msg.style.display = "block";
-        msg.className = "upload-msg err";
-        msg.textContent = "Upload failed: " + err.message;
+        finishProcessingState();
+        showUploadMessage("Upload failed: " + err.message, false);
     }
 
     document.getElementById("fileInput").value = "";
+}
+
+function setProcessingState(label) {
+    const prog = document.getElementById("progressWrap");
+    const lbl = document.getElementById("progressLabel");
+    prog.style.display = "block";
+    lbl.textContent = label;
+}
+
+function finishProcessingState() {
+    document.getElementById("progressWrap").style.display = "none";
+}
+
+function showUploadMessage(text, ok) {
+    const msg = document.getElementById("uploadMsg");
+    msg.style.display = "block";
+    msg.className = ok ? "upload-msg ok" : "upload-msg err";
+    msg.textContent = text;
 
     setTimeout(() => {
         msg.style.display = "none";
     }, 6000);
+}
+
+
+// ---------------------------------------------------------
+// Job Polling
+// ---------------------------------------------------------
+
+async function pollLatestJob() {
+    try {
+        const res = await fetch(`${API}/jobs/latest`, {
+            headers: authHeaders()
+        });
+
+        if (!res.ok) return;
+
+        const data = await res.json();
+
+        if (data.job && ["queued", "running"].includes(data.job.status)) {
+            currentJobId = data.job.id;
+            pollJob(data.job.id);
+        }
+    } catch (err) {
+        console.error("Job status error:", err);
+    }
+}
+
+async function pollJob(jobId) {
+    if (!jobId) return;
+
+    if (jobPollTimer) {
+        clearTimeout(jobPollTimer);
+    }
+
+    try {
+        const res = await fetch(`${API}/jobs/${jobId}`, {
+            headers: authHeaders()
+        });
+
+        if (!res.ok) {
+            finishProcessingState();
+            return;
+        }
+
+        const job = await res.json();
+        setProcessingState(`${job.kind}: ${job.step}`);
+
+        if (job.status === "complete") {
+            finishProcessingState();
+            showUploadMessage(job.message || "Processing complete.", true);
+            currentJobId = null;
+            suggestionsLoaded = false;
+            currentSuggestions = [];
+            await loadDocs();
+            await loadCacheStats();
+            await loadSuggestions(true);
+            return;
+        }
+
+        if (job.status === "failed") {
+            finishProcessingState();
+            showUploadMessage(job.message || "Processing failed.", false);
+            currentJobId = null;
+            return;
+        }
+
+        jobPollTimer = setTimeout(() => pollJob(jobId), 1500);
+
+    } catch (err) {
+        console.error("Job poll error:", err);
+        jobPollTimer = setTimeout(() => pollJob(jobId), 2500);
+    }
 }
 
 
@@ -101,37 +265,20 @@ async function uploadFile(file) {
 async function loadSuggestions(forceRefresh = false) {
     const container = document.getElementById("suggestionsBox");
 
-    if (!container) return;
-
-    // Prevent two /suggestions requests at the same time.
-    if (suggestionsRequestRunning) {
-        return;
-    }
-
-    // Keep current suggestions visible unless refresh is required.
-    if (suggestionsLoaded && !forceRefresh) {
-        return;
-    }
+    if (!container || suggestionsRequestRunning) return;
+    if (suggestionsLoaded && !forceRefresh) return;
 
     suggestionsRequestRunning = true;
-
-    container.innerHTML = `
-        <div class="suggestion-loading">
-            ⏳ Generating suggestions from your documents...
-        </div>
-    `;
+    container.innerHTML = `<div class="suggestion-loading">Generating suggestions from your documents...</div>`;
 
     let timeoutId = null;
 
     try {
         const controller = new AbortController();
-
-        // Stop only if suggestion generation takes longer than 3 minutes.
-        timeoutId = setTimeout(() => {
-            controller.abort();
-        }, 180000);
+        timeoutId = setTimeout(() => controller.abort(), 180000);
 
         const res = await fetch(`${API}/suggestions`, {
+            headers: authHeaders(),
             signal: controller.signal
         });
 
@@ -140,7 +287,6 @@ async function loadSuggestions(forceRefresh = false) {
         }
 
         const data = await res.json();
-
         currentSuggestions = Array.isArray(data.suggestions)
             ? data.suggestions
             : [];
@@ -150,50 +296,31 @@ async function loadSuggestions(forceRefresh = false) {
 
     } catch (err) {
         console.error("Suggestions error:", err);
-
-        container.innerHTML = `
-            <div class="suggestion-loading">
-                No suggestions available right now.
-            </div>
-        `;
-
+        container.innerHTML = `<div class="suggestion-loading">No suggestions available right now.</div>`;
         suggestionsLoaded = false;
 
     } finally {
-        if (timeoutId) {
-            clearTimeout(timeoutId);
-        }
-
+        if (timeoutId) clearTimeout(timeoutId);
         suggestionsRequestRunning = false;
     }
 }
 
 function renderSuggestions(suggestions) {
     const container = document.getElementById("suggestionsBox");
-
     if (!container) return;
 
     container.innerHTML = "";
 
     if (!suggestions || suggestions.length === 0) {
-        container.innerHTML = `
-            <div class="suggestion-loading">
-                No document-based suggestions are available yet.
-            </div>
-        `;
+        container.innerHTML = `<div class="suggestion-loading">No document-based suggestions are available yet.</div>`;
         return;
     }
 
     suggestions.forEach((question) => {
         const button = document.createElement("button");
-
         button.className = "suggestion-chip";
         button.textContent = question;
-
-        button.addEventListener("click", () => {
-            ask(question);
-        });
-
+        button.addEventListener("click", () => ask(question));
         container.appendChild(button);
     });
 }
@@ -205,7 +332,9 @@ function renderSuggestions(suggestions) {
 
 async function loadDocs() {
     try {
-        const res = await fetch(`${API}/documents`);
+        const res = await fetch(`${API}/documents`, {
+            headers: authHeaders()
+        });
 
         if (!res.ok) {
             throw new Error("Could not load documents");
@@ -219,9 +348,7 @@ async function loadDocs() {
         const list = document.getElementById("docList");
 
         if (!docs.length) {
-            list.innerHTML = `
-                <div class="no-docs">No documents yet</div>
-            `;
+            list.innerHTML = `<div class="no-docs">No documents yet</div>`;
             return;
         }
 
@@ -251,21 +378,16 @@ async function loadDocs() {
 
             info.appendChild(name);
             info.appendChild(size);
-
             left.appendChild(icon);
             left.appendChild(info);
 
             const deleteButton = document.createElement("button");
             deleteButton.className = "del-btn";
-            deleteButton.textContent = "✕";
-
-            deleteButton.addEventListener("click", () => {
-                deleteDoc(doc.name);
-            });
+            deleteButton.textContent = "Delete";
+            deleteButton.addEventListener("click", () => deleteDoc(doc.name));
 
             item.appendChild(left);
             item.appendChild(deleteButton);
-
             list.appendChild(item);
         });
 
@@ -278,28 +400,29 @@ function fileIcon(name) {
     const ext = name.split(".").pop().toLowerCase();
 
     return {
-        pdf: "📕",
-        docx: "📘",
-        xlsx: "📗",
-        xls: "📗",
-        csv: "📊",
-        html: "🌐",
-        htm: "🌐",
-        txt: "📄",
-        md: "📝"
-    }[ext] || "📄";
+        pdf: "PDF",
+        docx: "DOC",
+        xlsx: "XLS",
+        xls: "XLS",
+        csv: "CSV",
+        html: "WEB",
+        htm: "WEB",
+        txt: "TXT",
+        md: "MD"
+    }[ext] || "DOC";
 }
 
 async function deleteDoc(name) {
-    if (!confirm(`Delete ${name}?`)) {
-        return;
-    }
+    if (!confirm(`Delete ${name}?`)) return;
+
+    setProcessingState(`Deleting ${name}...`);
 
     try {
         const res = await fetch(
             `${API}/documents/${encodeURIComponent(name)}`,
             {
-                method: "DELETE"
+                method: "DELETE",
+                headers: authHeaders()
             }
         );
 
@@ -307,18 +430,24 @@ async function deleteDoc(name) {
             throw new Error("Could not delete document");
         }
 
+        const data = await res.json();
         suggestionsLoaded = false;
         currentSuggestions = [];
-
         await loadDocs();
-        await loadCacheStats();
-        await loadSuggestions(true);
 
-        sysMsg(`🗑️ ${name} deleted`);
+        if (data.job_id) {
+            pollJob(data.job_id);
+        } else {
+            finishProcessingState();
+            await loadSuggestions(true);
+        }
+
+        sysMsg(`${name} deleted`);
 
     } catch (err) {
         console.error("Delete failed:", err);
-        sysMsg("❌ Could not delete document");
+        finishProcessingState();
+        sysMsg("Could not delete document");
     }
 }
 
@@ -337,24 +466,16 @@ async function loadCacheStats() {
 
         const data = await res.json();
         const ok = data.status === "connected";
-
         const el = document.getElementById("cacheStatus");
 
-        el.textContent = ok
-            ? "🟢 Connected"
-            : "🔴 Offline";
-
-        el.className = "stat-val " + (
-            ok ? "on" : "off"
-        );
+        el.textContent = ok ? "Connected" : "Offline";
+        el.className = "stat-val " + (ok ? "on" : "off");
 
         document.getElementById("cachedCount").textContent =
-            data.cached_answers ?? "—";
+            data.cached_answers ?? "-";
 
         document.getElementById("cacheTTL").textContent =
-            data.ttl_seconds
-                ? `${data.ttl_seconds / 60} min`
-                : "—";
+            data.ttl_seconds ? `${data.ttl_seconds / 60} min` : "-";
 
     } catch (err) {
         console.error("Cache stats error:", err);
@@ -373,15 +494,13 @@ async function clearCache() {
 
         suggestionsLoaded = false;
         currentSuggestions = [];
-
         await loadCacheStats();
         await loadSuggestions(true);
-
-        sysMsg("⚡ Cache cleared");
+        sysMsg("Cache cleared");
 
     } catch (err) {
         console.error("Cache clear error:", err);
-        sysMsg("❌ Could not clear cache");
+        sysMsg("Could not clear cache");
     }
 }
 
@@ -394,19 +513,12 @@ async function ask(question) {
     const input = document.getElementById("qInput");
     const q = question || input.value.trim();
 
-    if (!q) {
-        return;
-    }
+    if (!q) return;
 
     input.value = "";
-
     addMsg(q, "user");
 
-    const loadId = addMsg(
-        "⏳ Searching documents...",
-        "loading"
-    );
-
+    const loadId = addMsg("Searching documents...", "loading");
     const btn = document.getElementById("sendBtn");
 
     btn.disabled = true;
@@ -415,12 +527,8 @@ async function ask(question) {
     try {
         const res = await fetch(`${API}/ask`, {
             method: "POST",
-            headers: {
-                "Content-Type": "application/json"
-            },
-            body: JSON.stringify({
-                question: q
-            })
+            headers: authHeaders({"Content-Type": "application/json"}),
+            body: JSON.stringify({question: q})
         });
 
         if (!res.ok) {
@@ -428,35 +536,18 @@ async function ask(question) {
         }
 
         const data = await res.json();
-
         removeMsg(loadId);
-
-        // Backend already supplies follow-up if enabled.
-        // Frontend does not call /followup separately.
-        const followup = data.followup || null;
-
-        addBotMsg(
-            data.answer,
-            data.cached,
-            followup
-        );
-
-        // Updates cache status only after an actual question.
+        addBotMsg(data.answer, data.followup || null);
         loadCacheStats();
 
     } catch (err) {
         console.error("Ask error:", err);
-
         removeMsg(loadId);
-
-        addMsg(
-            "❌ Cannot connect. Is the API running?",
-            "bot"
-        );
+        addMsg("Cannot connect. Is the API running?", "bot");
 
     } finally {
         btn.disabled = false;
-        btn.textContent = "Send ➤";
+        btn.textContent = "Send";
         input.focus();
     }
 }
@@ -468,7 +559,6 @@ async function ask(question) {
 
 function addMsg(text, type) {
     const box = document.getElementById("chatBox");
-
     const div = document.createElement("div");
     const id = "m" + Date.now() + Math.random();
 
@@ -482,28 +572,14 @@ function addMsg(text, type) {
     return id;
 }
 
-function addBotMsg(answer, cached, followup) {
+function addBotMsg(answer, followup) {
     const box = document.getElementById("chatBox");
-
     const div = document.createElement("div");
     div.className = "msg bot-msg";
 
     const answerText = document.createElement("span");
     answerText.textContent = answer;
-
     div.appendChild(answerText);
-
-    if (cached) {
-        const badge = document.createElement("span");
-
-        badge.className = "cache-badge";
-        badge.textContent = "⚡ cached";
-
-        div.appendChild(badge);
-    }
-
-    // No source section is created here.
-    // Source names remain available internally in backend response.
 
     if (followup) {
         const fu = document.createElement("div");
@@ -511,11 +587,8 @@ function addBotMsg(answer, cached, followup) {
 
         const button = document.createElement("button");
         button.className = "followup-single-btn";
-        button.textContent = "💡 " + followup;
-
-        button.addEventListener("click", () => {
-            ask(followup);
-        });
+        button.textContent = followup;
+        button.addEventListener("click", () => ask(followup));
 
         fu.appendChild(button);
         div.appendChild(fu);
@@ -531,11 +604,9 @@ function removeMsg(id) {
 
 function sysMsg(text) {
     const box = document.getElementById("chatBox");
-
     const div = document.createElement("div");
     div.className = "system-msg";
     div.textContent = text;
-
     box.appendChild(div);
     box.scrollTop = box.scrollHeight;
 }

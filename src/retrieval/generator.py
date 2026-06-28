@@ -2,10 +2,15 @@ import requests
 import os
 import re
 
+from src.config_loader import load_config
+
 # OLLAMA_HOST  = os.getenv("OLLAMA_URL", "http://host.docker.internal:11434")  # for docker container
-OLLAMA_HOST = os.getenv("OLLAMA_URL", "http://localhost:11434") # using localhost
-#OLLAMA_MODEL = "qwen2.5:7b"  
-OLLAMA_MODEL = "qwen2.5:3b" 
+config = load_config()
+OLLAMA_HOST = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
+OLLAMA_MODEL = os.getenv(
+    "OLLAMA_MODEL",
+    config.get("generation", {}).get("answer_model", "qwen2.5:7b")
+)
 OLLAMA_URL   = f"{OLLAMA_HOST}/api/generate"
 
 

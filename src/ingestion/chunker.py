@@ -71,7 +71,8 @@ def get_overlap_sentences(
 
 def create_chunk(
     sentences: list[str],
-    source: str
+    source: str,
+    content_type: str = "text"
 ) -> dict | None:
     """
     Convert a list of sentences into one ChromaDB-ready chunk.
@@ -83,7 +84,8 @@ def create_chunk(
 
     return {
         "text": text,
-        "source": source
+        "source": source,
+        "content_type": content_type
     }
 
 
@@ -105,7 +107,8 @@ def fixed_chunk(text: str, source: str) -> list[dict]:
         if chunk_text and len(chunk_text) >= MIN_CHUNK:
             chunks.append({
                 "text": chunk_text,
-                "source": source
+                "source": source,
+                "content_type": "text"
             })
 
         start += max(1, CHUNK_SIZE - OVERLAP)
@@ -241,6 +244,91 @@ def embedding_semantic_chunk(
     return chunks
 
 
+def split_table_blocks(text: str) -> list[dict]:
+    """
+    Separate parser-provided [TABLE] blocks from surrounding prose.
+
+    Table chunks stay whole so row/column relationships are preserved
+    during retrieval and answer generation.
+    """
+    pattern = re.compile(
+        r"\[TABLE[^\]]*\].*?\[/TABLE\]",
+        flags=re.DOTALL | re.IGNORECASE
+    )
+
+    blocks = []
+    cursor = 0
+
+    for match in pattern.finditer(text):
+        before = text[cursor:match.start()].strip()
+
+        if before:
+            blocks.append({
+                "text": before,
+                "content_type": "text"
+            })
+
+        blocks.append({
+            "text": match.group(0).strip(),
+            "content_type": "table"
+        })
+
+        cursor = match.end()
+
+    after = text[cursor:].strip()
+
+    if after:
+        blocks.append({
+            "text": after,
+            "content_type": "text"
+        })
+
+    return blocks or [{
+        "text": text,
+        "content_type": "text"
+    }]
+
+
+def chunk_table_block(text: str, source: str) -> list[dict]:
+    if len(text) <= CHUNK_SIZE * 2:
+        return [{
+            "text": text,
+            "source": source,
+            "content_type": "table"
+        }]
+
+    rows = [
+        row
+        for row in text.splitlines()
+        if row.strip()
+    ]
+
+    chunks = []
+    current_rows = []
+
+    for row in rows:
+        proposed = "\n".join(current_rows + [row])
+
+        if current_rows and len(proposed) > CHUNK_SIZE:
+            chunks.append({
+                "text": "\n".join(current_rows),
+                "source": source,
+                "content_type": "table"
+            })
+            current_rows = current_rows[-1:]
+
+        current_rows.append(row)
+
+    if current_rows:
+        chunks.append({
+            "text": "\n".join(current_rows),
+            "source": source,
+            "content_type": "table"
+        })
+
+    return chunks
+
+
 def chunk_documents(docs: list[dict]) -> list[dict]:
     """
     Chunk every parsed document.
@@ -250,6 +338,7 @@ def chunk_documents(docs: list[dict]) -> list[dict]:
     for doc in docs:
         text = doc["text"]
         source = doc["source"]
+        owner = doc.get("owner", "default")
 
         print(
             f"  Chunking {source} "
@@ -257,13 +346,25 @@ def chunk_documents(docs: list[dict]) -> list[dict]:
             f"strategy={STRATEGY}"
         )
 
-        if STRATEGY == "semantic":
-            chunks = embedding_semantic_chunk(
-                text,
-                source
-            )
-        else:
-            chunks = fixed_chunk(text, source)
+        chunks = []
+
+        for block in split_table_blocks(text):
+            block_type = block["content_type"]
+            block_text = block["text"]
+
+            if block_type == "table":
+                chunks.extend(
+                    chunk_table_block(block_text, source)
+                )
+            elif STRATEGY == "semantic":
+                chunks.extend(
+                    embedding_semantic_chunk(
+                        block_text,
+                        source
+                    )
+                )
+            else:
+                chunks.extend(fixed_chunk(block_text, source))
 
         # Final safety fallback.
         if not chunks:
@@ -273,6 +374,9 @@ def chunk_documents(docs: list[dict]) -> list[dict]:
             )
 
             chunks = fixed_chunk(text, source)
+
+        for chunk in chunks:
+            chunk["owner"] = owner
 
         print(f"  {source}: {len(chunks)} chunks")
 

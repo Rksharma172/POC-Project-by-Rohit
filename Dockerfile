@@ -31,4 +31,4 @@ RUN mkdir -p documents chroma_db logs templates
 EXPOSE 8000
 
 # Run FastAPI
-CMD ["python", "-m", "uvicorn", "src.api:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+CMD ["python", "-m", "uvicorn", "src.api:app", "--host", "0.0.0.0", "--port", "8000"]

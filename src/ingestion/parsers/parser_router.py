@@ -19,7 +19,7 @@ PARSER_MAP = {
 }
 
 
-def load_documents(folder):
+def load_documents(folder, owner="default"):
     docs = []
 
     for file in os.listdir(folder):
@@ -38,7 +38,11 @@ def load_documents(folder):
             print(f"  Skipped (no text extracted): {file}")
             continue
 
-        docs.append({"text": text, "source": file})
+        docs.append({
+            "text": text,
+            "source": file,
+            "owner": owner
+        })
         print(f"  {len(text)} characters extracted")
 
     return docs

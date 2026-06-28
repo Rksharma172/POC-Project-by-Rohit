@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AskPolicy — Internal Policy Q&A</title>
+    <title>AskPolicy - Internal Policy Q&A</title>
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -11,15 +11,39 @@
 
     <div class="sidebar">
         <div class="card">
-            <h3>📁 Upload Documents</h3>
+            <h3>Demo Account</h3>
+            <div class="stat-row">
+                <span class="stat-label">Active user</span>
+                <span class="stat-val" id="activeUser">default</span>
+            </div>
+            <div class="demo-note">
+                Optional test login. Use default for local files, or sign in to
+                test per-user document separation.
+            </div>
+            <div class="demo-accounts">
+                <div><b>hr</b> / hr-demo</div>
+                <div><b>finance</b> / finance-demo</div>
+                <div><b>admin</b> / admin-demo</div>
+            </div>
+            <input class="login-input" id="loginUser" type="text" placeholder="Username">
+            <input class="login-input" id="loginPass" type="password" placeholder="Password">
+            <div class="login-actions">
+                <button class="login-btn" onclick="login()">Login</button>
+                <button class="logout-btn" onclick="logout()">Logout</button>
+            </div>
+            <div class="login-msg" id="loginMsg"></div>
+        </div>
+
+        <div class="card">
+            <h3>Upload Documents</h3>
             <div class="drop-zone" id="dropZone"
                  onclick="document.getElementById('fileInput').click()"
                  ondragover="onDragOver(event)"
                  ondragleave="onDragLeave(event)"
                  ondrop="onDrop(event)">
-                <div class="drop-icon">☁️</div>
-                <div class="drop-text"><b>Click to upload</b> or drag & drop</div>
-                <div class="drop-formats">PDF · DOCX · XLSX · CSV · HTML · TXT</div>
+                <div class="drop-icon">UPLOAD</div>
+                <div class="drop-text"><b>Click to upload</b> or drag and drop</div>
+                <div class="drop-formats">PDF / DOCX / XLSX / CSV / HTML / TXT</div>
             </div>
             <input type="file" id="fileInput"
                    accept=".pdf,.docx,.xlsx,.csv,.html,.txt,.md"
@@ -32,25 +56,25 @@
         </div>
 
         <div class="card">
-            <h3>📚 Documents (<span id="docCount">0</span>)</h3>
+            <h3>Documents (<span id="docCount">0</span>)</h3>
             <div class="doc-list" id="docList">
                 <div class="no-docs">No documents yet</div>
             </div>
         </div>
 
         <div class="card">
-            <h3>⚡ Redis Cache</h3>
-            <div class="stat-row"><span class="stat-label">Status</span><span class="stat-val" id="cacheStatus">—</span></div>
-            <div class="stat-row"><span class="stat-label">Cached Answers</span><span class="stat-val" id="cachedCount">—</span></div>
-            <div class="stat-row"><span class="stat-label">TTL</span><span class="stat-val" id="cacheTTL">—</span></div>
-            <button class="cache-clear-btn" onclick="clearCache()">🗑️ Clear Cache</button>
+            <h3>Redis Cache</h3>
+            <div class="stat-row"><span class="stat-label">Status</span><span class="stat-val" id="cacheStatus">-</span></div>
+            <div class="stat-row"><span class="stat-label">Cached Answers</span><span class="stat-val" id="cachedCount">-</span></div>
+            <div class="stat-row"><span class="stat-label">TTL</span><span class="stat-val" id="cacheTTL">-</span></div>
+            <button class="cache-clear-btn" onclick="clearCache()">Clear Cache</button>
         </div>
     </div>
 
     <div class="chat-panel">
         <div class="chat-header">
-            <h1>🏢 AskPolicy</h1>
-            <p>Internal Policy Q&A · RAG + Qwen 2.5 · Runs Locally</p>
+            <h1>AskPolicy</h1>
+            <p>Internal Policy Q&A / RAG + Qwen 2.5 / Runs Locally</p>
         </div>
 
         <div class="chat-box" id="chatBox">
@@ -61,7 +85,7 @@
             </div>
 
             <div class="suggestions-inline" id="suggestionsBox">
-                <div class="suggestion-loading">⏳ Loading suggestions...</div>
+                <div class="suggestion-loading">Loading suggestions...</div>
             </div>
         </div>
 
@@ -69,7 +93,7 @@
             <input type="text" id="qInput"
                    placeholder="Ask about company policies..."
                    onkeypress="if(event.key==='Enter') ask()">
-            <button class="send-btn" id="sendBtn" onclick="ask()">Send ➤</button>
+            <button class="send-btn" id="sendBtn" onclick="ask()">Send</button>
         </div>
     </div>
 </div>

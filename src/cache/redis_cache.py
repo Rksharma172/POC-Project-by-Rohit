@@ -1,14 +1,15 @@
 import redis
 import json
 import hashlib
+import os
 from src.config_loader import load_config
 
 config = load_config()
 
 try:
     cache_client = redis.Redis(
-        host=config["cache"]["host"],
-        port=config["cache"]["port"],
+        host=os.getenv("REDIS_HOST", config["cache"]["host"]),
+        port=int(os.getenv("REDIS_PORT", config["cache"]["port"])),
         db=0,
         decode_responses=True
     )
